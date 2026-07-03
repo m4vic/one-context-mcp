@@ -2,8 +2,6 @@
 
 > Stop re-explaining your project to every AI tool you open.
 
-![one-context architecture](assets/architecture.png)
-
 ---
 
 ## The Problem
@@ -22,12 +20,33 @@ You say this dozens of times a day. It costs focus, time, and tokens.
 
 `one-context` is a local MCP server that acts as shared memory for all your AI tools. Every tool reads from it when it wakes up and writes to it when it finishes. Your project knowledge lives in one place, forever.
 
-```
-Claude ──────┐
-Cline ───────┤
-Codex ───────┼──▶  one-context  ──▶  SQLite (local, yours, private)
-Antigravity ─┤
-Ollama ──────┘
+```mermaid
+graph TD
+    classDef rootNode fill:#0d1117,stroke:#58a6ff,stroke-width:3px,color:#c9d1d9,font-size:16px,font-weight:bold;
+    classDef aiNode fill:#161b22,stroke:#3fb950,stroke-width:2px,color:#c9d1d9,font-size:14px;
+    classDef bucketNode fill:#21262d,stroke:#8b949e,stroke-dasharray: 5 5,color:#c9d1d9;
+
+    A([one-context MCP]):::rootNode
+
+    C1[Claude Code]:::aiNode
+    C2[Cline]:::aiNode
+    C3[Antigravity]:::aiNode
+    C4[Codex]:::aiNode
+
+    B1[(WHAT\nProject Scope)]:::bucketNode
+    B2[(DONE\nHistory)]:::bucketNode
+    B3[(NOW\nCurrent Task)]:::bucketNode
+    B4[(MAP\nKey Files)]:::bucketNode
+
+    C1 <-->|reads/writes| A
+    C2 <-->|reads/writes| A
+    C3 <-->|reads/writes| A
+    C4 <-->|reads/writes| A
+
+    A --- B1
+    A --- B2
+    A --- B3
+    A --- B4
 ```
 
 You explain your project **once**. Every tool knows it **forever**.
