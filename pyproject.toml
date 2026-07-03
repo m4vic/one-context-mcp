@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "one-context"
+version = "0.1.0"
+description = "Combined Context — One MCP server. Every AI tool. No re-explaining."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "uvicorn[standard]>=0.29.0",
+    "click>=8.1.0",
+    "sse-starlette>=2.0.0",
+]
+
+[project.optional-dependencies]
+llm = ["anthropic>=0.40.0"]
+
+[project.scripts]
+ctx = "ctx.cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ctx"]
