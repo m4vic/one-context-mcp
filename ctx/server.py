@@ -1,8 +1,8 @@
 """MCP Server for ctx - Combined Context.
 
 Exposes tools over SSE/stdio transport:
-  ctx_get, ctx_update, ctx_note, ctx_history, ctx_link, ctx_reset, ctx_list,
-  ctx_map, ctx_search
+  ctx_get, ctx_strict_get, ctx_update, ctx_note, ctx_history, ctx_link,
+  ctx_reset, ctx_list, ctx_map, ctx_search
 
 Uses a bare ASGI app with manual path routing so that the MCP SDK's
 SseServerTransport gets direct, unmodified access to scope/receive/send.
@@ -10,6 +10,8 @@ SseServerTransport gets direct, unmodified access to scope/receive/send.
 
 import json
 import logging
+import os
+from pathlib import Path
 
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
@@ -43,6 +45,60 @@ logger = logging.getLogger("ctx")
 mcp_server = Server("ctx", version=__version__)
 
 
+def _canonical_repo_path(path: str | None) -> str:
+    """Normalize a repo path for comparison without requiring it to exist."""
+    if not path:
+        return ""
+    return os.path.normcase(os.path.abspath(str(Path(path).expanduser())))
+
+
+def _repo_paths_match(left: str | None, right: str | None) -> bool:
+    left_path = _canonical_repo_path(left)
+    right_path = _canonical_repo_path(right)
+    return bool(left_path and right_path and left_path == right_path)
+
+
+def _repo_guard(project: str, stored_repo_path: str, requested_repo_path: str | None, strict: bool = False) -> dict | None:
+    """Return a warning/error when a caller's current folder does not match the linked project."""
+    if strict and not stored_repo_path:
+        return {
+            "error": "Project is not linked to a repo_path.",
+            "project": project,
+            "hint": "Call ctx_link(project, repo_path) once before using strict access.",
+        }
+
+    if not requested_repo_path:
+        return None
+
+    if not stored_repo_path:
+        return {
+            "warning": "Project is not linked yet; this repo_path can be stored with ctx_link.",
+            "project": project,
+            "requested_repo_path": requested_repo_path,
+        }
+
+    if not _repo_paths_match(stored_repo_path, requested_repo_path):
+        payload = {
+            "project": project,
+            "stored_repo_path": stored_repo_path,
+            "requested_repo_path": requested_repo_path,
+            "hint": "Use the correct project name or call ctx_link only if this project was intentionally moved.",
+        }
+        if strict:
+            return {"error": "repo_path mismatch", **payload}
+        return {"warning": "repo_path mismatch", **payload}
+
+    return None
+
+
+def _with_git_info(result: dict) -> dict:
+    if "error" not in result and result.get("repo_path"):
+        git_info = get_git_summary(result["repo_path"])
+        if git_info:
+            result["git"] = git_info
+    return result
+
+
 @mcp_server.list_tools()
 async def handle_list_tools() -> list[Tool]:
     """Declare the tools this server exposes."""
@@ -64,9 +120,34 @@ async def handle_list_tools() -> list[Tool]:
                     "project": {
                         "type": "string",
                         "description": "Project name / namespace",
-                    }
+                    },
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Optional current workspace root. If it differs from the linked repo_path, a warning is returned.",
+                    },
                 },
                 "required": ["project"],
+            },
+        ),
+        Tool(
+            name="ctx_strict_get",
+            description=(
+                "Get context only if the supplied repo_path matches the linked project repo_path. "
+                "Use this when a client is inside a workspace and must avoid loading the wrong project."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project name / namespace",
+                    },
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Absolute path to the current workspace root.",
+                    },
+                },
+                "required": ["project", "repo_path"],
             },
         ),
         Tool(
@@ -75,7 +156,8 @@ async def handle_list_tools() -> list[Tool]:
                 "Update the project context with a session summary. "
                 "The server will intelligently merge this into the "
                 "WHAT/DONE/NOW/MAP buckets using smart merging. "
-                "Call this when you finish a task or hit a milestone."
+                "Call this when you finish a task or hit a milestone. "
+                "If repo_path is supplied and does not match an already linked project, the update is rejected."
             ),
             inputSchema={
                 "type": "object",
@@ -129,6 +211,10 @@ async def handle_list_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "If true, replaces the entire MAP. If false (default), appends to existing MAP.",
                     },
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Optional current workspace root. If it differs from the linked repo_path, the map update is rejected.",
+                    },
                 },
                 "required": ["project", "files"],
             },
@@ -161,7 +247,7 @@ async def handle_list_tools() -> list[Tool]:
                     },
                     "repo_path": {
                         "type": "string",
-                        "description": "Optional project repo root for strict file scoping.",
+                        "description": "Optional current workspace root. If it differs from the linked repo_path, the note merge is rejected.",
                     },
                 },
                 "required": ["project", "message"],
@@ -259,13 +345,25 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Route tool calls to the appropriate handler."""
     try:
         if name == "ctx_get":
-            result = get_project(arguments["project"])
+            project = arguments["project"]
+            result = get_project(project)
 
-            # Enrich with git info if repo_path is set
-            if "error" not in result and result.get("repo_path"):
-                git_info = get_git_summary(result["repo_path"])
-                if git_info:
-                    result["git"] = git_info
+            if "error" not in result:
+                guard = _repo_guard(project, result.get("repo_path", ""), arguments.get("repo_path"))
+                if guard:
+                    result["safety"] = guard
+                result = _with_git_info(result)
+
+        elif name == "ctx_strict_get":
+            project = arguments["project"]
+            result = get_project(project)
+
+            if "error" not in result:
+                guard = _repo_guard(project, result.get("repo_path", ""), arguments["repo_path"], strict=True)
+                if guard and "error" in guard:
+                    result = guard
+                else:
+                    result = _with_git_info(result)
 
         elif name == "ctx_update":
             project = arguments["project"]
@@ -280,6 +378,11 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 logger.info(f"Auto-initializing project '{project}'")
                 init_project(project, repo_path=repo_path or "")
                 current = {"what": "", "done": "", "now": "", "map": ""}
+            else:
+                guard = _repo_guard(project, current.get("repo_path", ""), repo_path, strict=True)
+                if guard and "error" in guard:
+                    result = guard
+                    return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
             # Merge (local by default, LLM-enhanced if configured)
             repo_scope = repo_path or current.get("repo_path", "")
@@ -309,13 +412,19 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
             project = arguments["project"]
             files = arguments["files"]
             replace = arguments.get("replace", False)
+            repo_path = arguments.get("repo_path")
 
             # Get current map
             current = get_project(project)
             if "error" in current:
                 # Auto-init
-                init_project(project)
+                init_project(project, repo_path=repo_path or "")
                 current = {"map": ""}
+            else:
+                guard = _repo_guard(project, current.get("repo_path", ""), repo_path, strict=True)
+                if guard and "error" in guard:
+                    result = guard
+                    return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
             new_entries = '\n'.join(f'- {f}' for f in files)
             if replace:
@@ -340,6 +449,11 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 if "error" in current:
                     init_project(project, repo_path=repo_path or "")
                     current = {"what": "", "done": "", "now": "", "map": "", "repo_path": repo_path or ""}
+                else:
+                    guard = _repo_guard(project, current.get("repo_path", ""), repo_path, strict=True)
+                    if guard and "error" in guard:
+                        result = guard
+                        return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
                 saved_message = add_project_message(project, message, author=author)
                 if "error" in saved_message or not merge:
@@ -497,10 +611,11 @@ async def app(scope, receive, send):
         await _send_json(send, 200, {
             "status": "ok",
             "server": "ctx",
-            "version": "0.2.0",
+            "version": __version__,
             "tools": [
-                "ctx_get", "ctx_update", "ctx_note", "ctx_history", "ctx_link",
-                "ctx_map", "ctx_search", "ctx_reset", "ctx_list",
+                "ctx_get", "ctx_strict_get", "ctx_update", "ctx_note",
+                "ctx_history", "ctx_link", "ctx_map", "ctx_search",
+                "ctx_reset", "ctx_list",
             ],
         })
         return

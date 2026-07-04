@@ -247,6 +247,7 @@ sequenceDiagram
 | Tool | Purpose |
 |------|---------|
 | `ctx_get(project)` | Load WHAT, DONE, NOW, MAP, repo path, and git info |
+| `ctx_strict_get(project, repo_path)` | Load context only when the current workspace path matches the linked project |
 | `ctx_update(project, session_summary, tool_name)` | Merge a session summary into project context |
 | `ctx_map(project, files, replace)` | Register important files manually |
 | `ctx_note(project, message, author, merge)` | Store a user-authored note for one project |
@@ -335,7 +336,7 @@ pip install -U one-ctx
 Install a specific version:
 
 ```bash
-pip install one-ctx==0.2.0
+pip install one-ctx==0.2.1
 ```
 
 Install directly from GitHub:
@@ -384,6 +385,9 @@ Example:
 ```text
 Use ctx_link for project asrt with repo_path F:\ASRT.
 ```
+
+For stricter reads, ask the assistant to call `ctx_strict_get(project, repo_path)`.
+It refuses to return context if the folder does not match the linked project.
 
 ---
 
