@@ -1,1 +1,3 @@
-"""ctx — Combined Context MCP Server."""
+"""ctx - Combined Context MCP Server."""
+
+__version__ = "0.2.0"

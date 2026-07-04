@@ -1,28 +1,41 @@
-"""Context merging for ctx — Combined Context.
+"""Context merging for ctx - Combined Context.
 
-Four merge modes (auto-selected based on what's configured):
+Four merge modes (selected with CTX_MERGE_MODE):
 
-1. LOCAL (default) — Smart rule-based merge. No API keys, no models,
+1. LOCAL (default) - Smart rule-based merge. No API keys, no models,
    no internet. Always works. This is the foundation.
 
-2. OLLAMA (local LLM) — Uses any model running on your local Ollama.
+2. OLLAMA (local LLM) - Uses any model running on your local Ollama.
    Set CTX_OLLAMA_MODEL=llama3.2 (or any model you have pulled).
    Still 100% local, still zero API keys.
 
-3. CLOUD API (optional) — Claude, OpenAI, or any OpenAI-compatible API.
+3. CLOUD API (optional) - Claude, OpenAI, or any OpenAI-compatible API.
    Set ANTHROPIC_API_KEY or OPENAI_API_KEY + OPENAI_MODEL.
    For custom endpoints: OPENAI_BASE_URL=http://your-api/v1
 
-Priority order: Ollama > Anthropic > OpenAI > Local fallback
+Set CTX_MERGE_MODE=auto to try Ollama > Anthropic > OpenAI > local fallback.
 """
 
 import os
 import json
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
+
+
+_VALID_MERGE_MODES = {"local", "auto", "ollama", "anthropic", "openai"}
+
+
+def _get_merge_mode() -> str:
+    """Return the configured merge mode, defaulting to fully local behavior."""
+    mode = os.environ.get("CTX_MERGE_MODE", "local").strip().lower()
+    if mode not in _VALID_MERGE_MODES:
+        print(f"[ctx] Invalid CTX_MERGE_MODE={mode!r}; using local merge.")
+        return "local"
+    return mode
 
 
 MERGE_SYSTEM_PROMPT = """\
@@ -36,7 +49,7 @@ Rules:
 - WHAT = project description, stack, architecture, constraints. Only update if the new info changes the project's nature.
 - DONE = decisions made, files changed, problems solved. Append new items, deduplicate, keep concise. Remove items that are superseded.
 - NOW  = current task, current state, what's in progress. REPLACE with whatever is current. Old "now" items move to DONE if completed, or get dropped if abandoned.
-- MAP  = important file paths and what they do. Only add files that are genuinely important (entry points, core modules, config files). Format as "- path/to/file — description". Remove stale entries if the summary says files were deleted or moved.
+- MAP  = important file paths and what they do. Only add files that are genuinely important (entry points, core modules, config files). Format as "- path/to/file - description". When repo_path is known, prefer file paths under that root and ignore unrelated paths. Remove stale entries if the summary says files were deleted or moved.
 - Be concise. Each bucket should be a clean bulleted list, not a wall of text.
 - Preserve important details (file paths, decisions, constraints) but drop chatter.
 - If the new summary contradicts old info, the new summary wins.
@@ -48,8 +61,9 @@ Respond with ONLY a JSON object (no markdown fences, no explanation):
 
 def _build_user_message(
     current_what: str, current_done: str, current_now: str,
-    current_map: str, session_summary: str, tool_name: str,
+    current_map: str, session_summary: str, tool_name: str, repo_path: str = "",
 ) -> str:
+    project_root = f"\n### PROJECT ROOT\n{repo_path}" if repo_path else ""
     return f"""## Current Context
 
 ### WHAT (project description, stack, architecture)
@@ -62,7 +76,7 @@ def _build_user_message(
 {current_now or '(nothing yet)'}
 
 ### MAP (important files and their purpose)
-{current_map or '(no files mapped yet)'}
+{current_map or '(no files mapped yet)'}{project_root}
 
 ---
 
@@ -98,7 +112,7 @@ def _parse_llm_response(text: str, current_what: str, current_done: str,
 
 
 # ---------------------------------------------------------------------------
-# 1. LOCAL MERGE (default — always works, zero dependencies)
+# 1. LOCAL MERGE (default - always works, zero dependencies)
 # ---------------------------------------------------------------------------
 
 def _deduplicate_lines(text: str) -> str:
@@ -107,7 +121,7 @@ def _deduplicate_lines(text: str) -> str:
     result = []
     for line in text.strip().splitlines():
         stripped = line.strip()
-        normalized = re.sub(r'^[-*•]\s*', '', stripped).strip().lower()
+        normalized = re.sub(r'^[-*]\s*', '', stripped).strip().lower()
         if normalized and normalized not in seen:
             seen.add(normalized)
             result.append(line)
@@ -140,23 +154,43 @@ _CODE_EXTENSIONS = {
 }
 
 
-def _extract_file_paths(text: str) -> list[str]:
+
+def _path_within_repo(path: str, repo_path: str) -> bool:
+    """Keep absolute paths scoped to the project root when available."""
+    if not repo_path:
+        return True
+
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        return True
+
+    try:
+        return candidate.resolve(strict=False).is_relative_to(Path(repo_path).resolve(strict=False))
+    except Exception:
+        return False
+
+
+def _extract_file_paths(text: str, repo_path: str = "") -> list[str]:
     """Extract file paths from text that look like real code files."""
     paths = _FILE_PATH_RE.findall(text)
-    # Filter to only include paths with known code extensions
     result = []
+    seen = set()
     for p in paths:
         ext = '.' + p.rsplit('.', 1)[-1].lower() if '.' in p else ''
-        if ext in _CODE_EXTENSIONS:
-            result.append(p)
+        if ext in _CODE_EXTENSIONS and _path_within_repo(p, repo_path):
+            key = p.replace('/', '\\').lower()
+            if key not in seen:
+                seen.add(key)
+                result.append(p)
     return result
+
 
 
 def _local_merge(
     current_what: str, current_done: str, current_now: str,
-    current_map: str, session_summary: str, tool_name: str,
+    current_map: str, session_summary: str, tool_name: str, repo_path: str = "",
 ) -> dict:
-    """Smart local merge — no LLM, no API, always works.
+    """Smart local merge - no LLM, no API, always works.
 
     Strategy:
     - WHAT: Update only if summary contains project-level keywords.
@@ -203,14 +237,14 @@ def _local_merge(
 
     # --- MAP ---
     new_map = current_map
-    file_paths = _extract_file_paths(session_summary)
+    file_paths = _extract_file_paths(session_summary, repo_path=repo_path)
     if file_paths:
         existing_paths = set()
         for line in current_map.splitlines():
-            # Extract path from "- path — description" format
-            clean = re.sub(r'^[-*•]\s*', '', line.strip())
+            # Extract path from "- path - description" format
+            clean = re.sub(r'^[-*]\s*', '', line.strip())
             if clean:
-                path_part = clean.split(' — ')[0].split(' - ')[0].strip()
+                path_part = clean.split(' \u2014 ')[0].split(' - ')[0].strip()
                 existing_paths.add(path_part.lower())
 
         for fp in file_paths:
@@ -229,18 +263,18 @@ def _local_merge(
 
 
 # ---------------------------------------------------------------------------
-# 2. OLLAMA MERGE (local LLM — zero API keys, runs on your machine)
+# 2. OLLAMA MERGE (local LLM - zero API keys, runs on your machine)
 # ---------------------------------------------------------------------------
 
 def _ollama_merge(
     current_what: str, current_done: str, current_now: str,
-    current_map: str, session_summary: str, tool_name: str,
+    current_map: str, session_summary: str, tool_name: str, repo_path: str = "",
 ) -> Optional[dict]:
     """Use a local Ollama model for intelligent merge.
 
     Config via env vars:
-        CTX_OLLAMA_MODEL  — model name (e.g. llama3.2, mistral, gemma2)
-        CTX_OLLAMA_URL    — Ollama API URL (default: http://localhost:11434)
+        CTX_OLLAMA_MODEL  - model name (e.g. llama3.2, mistral, gemma2)
+        CTX_OLLAMA_URL    - Ollama API URL (default: http://localhost:11434)
     """
     model = os.environ.get("CTX_OLLAMA_MODEL")
     if not model:
@@ -251,7 +285,7 @@ def _ollama_merge(
 
     user_msg = _build_user_message(
         current_what, current_done, current_now, current_map,
-        session_summary, tool_name,
+        session_summary, tool_name, repo_path,
     )
 
     payload = json.dumps({
@@ -280,12 +314,12 @@ def _ollama_merge(
 
 
 # ---------------------------------------------------------------------------
-# 3. ANTHROPIC MERGE (optional cloud — needs ANTHROPIC_API_KEY)
+# 3. ANTHROPIC MERGE (optional cloud - needs ANTHROPIC_API_KEY)
 # ---------------------------------------------------------------------------
 
 def _anthropic_merge(
     current_what: str, current_done: str, current_now: str,
-    current_map: str, session_summary: str, tool_name: str,
+    current_map: str, session_summary: str, tool_name: str, repo_path: str = "",
 ) -> Optional[dict]:
     """Use Claude Haiku for merge. Only if ANTHROPIC_API_KEY is set."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -297,7 +331,7 @@ def _anthropic_merge(
         client = Anthropic(api_key=api_key)
         user_msg = _build_user_message(
             current_what, current_done, current_now, current_map,
-            session_summary, tool_name,
+            session_summary, tool_name, repo_path,
         )
         response = client.messages.create(
             model=os.environ.get("CTX_ANTHROPIC_MODEL", "claude-haiku-4-20250414"),
@@ -317,19 +351,19 @@ def _anthropic_merge(
 
 
 # ---------------------------------------------------------------------------
-# 4. OPENAI-COMPATIBLE MERGE (any API — OpenAI, Groq, Together, etc.)
+# 4. OPENAI-COMPATIBLE MERGE (any API - OpenAI, Groq, Together, etc.)
 # ---------------------------------------------------------------------------
 
 def _openai_merge(
     current_what: str, current_done: str, current_now: str,
-    current_map: str, session_summary: str, tool_name: str,
+    current_map: str, session_summary: str, tool_name: str, repo_path: str = "",
 ) -> Optional[dict]:
     """Use any OpenAI-compatible API for merge.
 
     Config via env vars:
-        OPENAI_API_KEY   — API key
-        OPENAI_MODEL     — model name (default: gpt-4o-mini)
-        OPENAI_BASE_URL  — custom endpoint (default: https://api.openai.com/v1)
+        OPENAI_API_KEY   - API key
+        OPENAI_MODEL     - model name (default: gpt-4o-mini)
+        OPENAI_BASE_URL  - custom endpoint (default: https://api.openai.com/v1)
     """
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -341,7 +375,7 @@ def _openai_merge(
 
     user_msg = _build_user_message(
         current_what, current_done, current_now, current_map,
-        session_summary, tool_name,
+        session_summary, tool_name, repo_path,
     )
 
     payload = json.dumps({
@@ -373,44 +407,42 @@ def _openai_merge(
 
 
 # ---------------------------------------------------------------------------
-# PUBLIC API — tries each provider in priority order, always falls back local
+# PUBLIC API - tries each provider in priority order, always falls back local
 # ---------------------------------------------------------------------------
 
 def merge_context(
     current_what: str, current_done: str, current_now: str,
-    current_map: str, session_summary: str, tool_name: str,
+    current_map: str, session_summary: str, tool_name: str, repo_path: str = "",
 ) -> dict:
     """Merge a session summary into the context buckets.
 
-    Priority: Ollama > Anthropic > OpenAI > Local
-    Always falls back to local merge if everything else fails.
+    Default mode is local. CTX_MERGE_MODE can be set to auto, ollama,
+    anthropic, or openai for model-assisted merging.
     """
-    # 1. Try Ollama (local LLM — best of both worlds)
-    result = _ollama_merge(
-        current_what, current_done, current_now, current_map,
-        session_summary, tool_name,
-    )
-    if result is not None:
-        return result
+    mode = _get_merge_mode()
+    if mode == "local":
+        return _local_merge(
+            current_what, current_done, current_now, current_map,
+            session_summary, tool_name, repo_path,
+        )
 
-    # 2. Try Anthropic (cloud)
-    result = _anthropic_merge(
-        current_what, current_done, current_now, current_map,
-        session_summary, tool_name,
-    )
-    if result is not None:
-        return result
+    providers = {
+        "ollama": [_ollama_merge],
+        "anthropic": [_anthropic_merge],
+        "openai": [_openai_merge],
+        "auto": [_ollama_merge, _anthropic_merge, _openai_merge],
+    }[mode]
 
-    # 3. Try OpenAI-compatible (cloud, or local via LM Studio etc.)
-    result = _openai_merge(
-        current_what, current_done, current_now, current_map,
-        session_summary, tool_name,
-    )
-    if result is not None:
-        return result
+    for provider in providers:
+        result = provider(
+            current_what, current_done, current_now, current_map,
+            session_summary, tool_name, repo_path,
+        )
+        if result is not None:
+            return result
 
-    # 4. Local merge — always works
+    # Local merge always remains the final fallback.
     return _local_merge(
         current_what, current_done, current_now, current_map,
-        session_summary, tool_name,
+        session_summary, tool_name, repo_path,
     )

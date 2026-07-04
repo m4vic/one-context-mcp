@@ -1,7 +1,8 @@
-"""MCP Server for ctx — Combined Context.
+"""MCP Server for ctx - Combined Context.
 
-Exposes six tools over SSE/stdio transport:
-  ctx_get, ctx_update, ctx_reset, ctx_list, ctx_map, ctx_search
+Exposes tools over SSE/stdio transport:
+  ctx_get, ctx_update, ctx_note, ctx_history, ctx_link, ctx_reset, ctx_list,
+  ctx_map, ctx_search
 
 Uses a bare ASGI app with manual path routing so that the MCP SDK's
 SseServerTransport gets direct, unmodified access to scope/receive/send.
@@ -14,6 +15,7 @@ from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent
 
+from ctx import __version__
 from ctx.database import (
     get_project,
     update_project,
@@ -23,6 +25,11 @@ from ctx.database import (
     init_project,
     search_projects,
     search_logs,
+    search_messages,
+    add_project_message,
+    list_project_history,
+    merge_map_content,
+    normalize_map_content,
 )
 from ctx.llm import merge_context
 from ctx.git import get_git_summary
@@ -33,7 +40,7 @@ logger = logging.getLogger("ctx")
 # MCP Server Setup
 # ---------------------------------------------------------------------------
 
-mcp_server = Server("ctx")
+mcp_server = Server("ctx", version=__version__)
 
 
 @mcp_server.list_tools()
@@ -80,7 +87,7 @@ async def handle_list_tools() -> list[Tool]:
                     "session_summary": {
                         "type": "string",
                         "description": (
-                            "Summary of what happened in this session — "
+                            "Summary of what happened in this session - "
                             "decisions made, files changed, current state."
                         ),
                     },
@@ -101,7 +108,7 @@ async def handle_list_tools() -> list[Tool]:
             description=(
                 "Register important files for a project. Use this to tell "
                 "other AI tools which files are the entry points, core modules, "
-                "or config files. Format each entry as 'path — description'."
+                "or config files. Format each entry as 'path - description'."
             ),
             inputSchema={
                 "type": "object",
@@ -115,7 +122,7 @@ async def handle_list_tools() -> list[Tool]:
                         "items": {"type": "string"},
                         "description": (
                             "List of important files. Each entry should be "
-                            "'path/to/file — what it does' (e.g. 'src/main.py — app entry point')"
+                            "'path/to/file - what it does' (e.g. 'src/main.py - app entry point')"
                         ),
                     },
                     "replace": {
@@ -124,6 +131,83 @@ async def handle_list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["project", "files"],
+            },
+        ),
+        Tool(
+            name="ctx_note",
+            description=(
+                "Add a user-authored note/message to one specific project. "
+                "By default the note is also merged into WHAT/DONE/NOW/MAP "
+                "so other tools can load it later with ctx_get."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project name / namespace",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "User note or instruction to attach to this project",
+                    },
+                    "author": {
+                        "type": "string",
+                        "description": "Optional note author, defaults to 'user'",
+                    },
+                    "merge": {
+                        "type": "boolean",
+                        "description": "If true (default), merge the note into project context buckets.",
+                    },
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Optional project repo root for strict file scoping.",
+                    },
+                },
+                "required": ["project", "message"],
+            },
+        ),
+        Tool(
+            name="ctx_history",
+            description=(
+                "Get recent update summaries and user notes for one project. "
+                "Use this when you need the audit trail for a specific project."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project name / namespace",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum updates/messages to return from each list, default 20.",
+                    },
+                },
+                "required": ["project"],
+            },
+        ),
+        Tool(
+            name="ctx_link",
+            description=(
+                "Create a project if needed and link it to an absolute repo path. "
+                "Use this once per project so future MAP extraction is scoped to "
+                "the correct workspace root."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project name / namespace",
+                    },
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Absolute path to the project's git/workspace root",
+                    },
+                },
+                "required": ["project", "repo_path"],
             },
         ),
         Tool(
@@ -198,6 +282,7 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 current = {"what": "", "done": "", "now": "", "map": ""}
 
             # Merge (local by default, LLM-enhanced if configured)
+            repo_scope = repo_path or current.get("repo_path", "")
             merged = merge_context(
                 current_what=current.get("what", ""),
                 current_done=current.get("done", ""),
@@ -205,6 +290,7 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 current_map=current.get("map", ""),
                 session_summary=session_summary,
                 tool_name=tool_name,
+                repo_path=repo_scope,
             )
 
             # Save
@@ -231,24 +317,87 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 init_project(project)
                 current = {"map": ""}
 
+            new_entries = '\n'.join(f'- {f}' for f in files)
             if replace:
-                new_map = '\n'.join(f'- {f}' for f in files)
+                new_map = normalize_map_content(new_entries)
             else:
                 existing = current.get("map", "")
-                new_entries = '\n'.join(f'- {f}' for f in files)
-                new_map = (existing.rstrip() + '\n' + new_entries).strip() if existing.strip() else new_entries
+                new_map = merge_map_content(existing, new_entries)
 
             result = update_project_map(project, new_map)
+
+        elif name == "ctx_note":
+            project = arguments["project"]
+            message = arguments["message"].strip()
+            author = arguments.get("author", "user") or "user"
+            merge = arguments.get("merge", True)
+            repo_path = arguments.get("repo_path")
+
+            if not message:
+                result = {"error": "message must not be empty"}
+            else:
+                current = get_project(project)
+                if "error" in current:
+                    init_project(project, repo_path=repo_path or "")
+                    current = {"what": "", "done": "", "now": "", "map": "", "repo_path": repo_path or ""}
+
+                saved_message = add_project_message(project, message, author=author)
+                if "error" in saved_message or not merge:
+                    result = {
+                        "message": saved_message,
+                        "context_updated": False,
+                    }
+                else:
+                    session_summary = f"User note from {author}: {message}"
+                    repo_scope = repo_path or current.get("repo_path", "")
+                    merged = merge_context(
+                        current_what=current.get("what", ""),
+                        current_done=current.get("done", ""),
+                        current_now=current.get("now", ""),
+                        current_map=current.get("map", ""),
+                        session_summary=session_summary,
+                        tool_name=f"user:{author}",
+                        repo_path=repo_scope,
+                    )
+                    context = update_project(
+                        name=project,
+                        what=merged["what"],
+                        done=merged["done"],
+                        now=merged["now"],
+                        map_=merged["map"],
+                        tool_name=f"user:{author}",
+                        summary=session_summary,
+                        repo_path=repo_path,
+                    )
+                    result = {
+                        "message": saved_message,
+                        "context_updated": "error" not in context,
+                        "context": context,
+                    }
+
+        elif name == "ctx_history":
+            result = list_project_history(
+                arguments["project"],
+                limit=arguments.get("limit", 20),
+            )
+
+        elif name == "ctx_link":
+            result = init_project(
+                arguments["project"],
+                repo_path=arguments["repo_path"],
+            )
 
         elif name == "ctx_search":
             query = arguments["query"]
             project_matches = search_projects(query)
             log_matches = search_logs(query)
+            message_matches = search_messages(query)
             result = {
                 "query": query,
                 "projects": project_matches,
                 "history": log_matches,
-                "total_matches": len(project_matches) + len(log_matches),
+                "messages": message_matches,
+                "total_matches": len(project_matches) + len(log_matches) + len(message_matches),
             }
 
         elif name == "ctx_reset":
@@ -268,7 +417,7 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 
 # ---------------------------------------------------------------------------
-# Bare ASGI App — no framework, no wrappers, no conflicts.
+# Bare ASGI App - no framework, no wrappers, no conflicts.
 # ---------------------------------------------------------------------------
 
 sse_transport = SseServerTransport("/messages/")
@@ -330,7 +479,7 @@ async def app(scope, receive, send):
         await send({"type": "http.response.body", "body": b""})
         return
 
-    # Route: GET /sse — SSE connection endpoint
+    # Route: GET /sse - SSE connection endpoint
     if path == "/sse" and method == "GET":
         async with sse_transport.connect_sse(scope, receive, send) as streams:
             await mcp_server.run(
@@ -338,18 +487,21 @@ async def app(scope, receive, send):
             )
         return
 
-    # Route: POST /messages/ — MCP message endpoint
+    # Route: POST /messages/ - MCP message endpoint
     if path.startswith("/messages") and method == "POST":
         await sse_transport.handle_post_message(scope, receive, send)
         return
 
-    # Route: GET /health — health check
+    # Route: GET /health - health check
     if path == "/health" and method == "GET":
         await _send_json(send, 200, {
             "status": "ok",
             "server": "ctx",
             "version": "0.2.0",
-            "tools": ["ctx_get", "ctx_update", "ctx_map", "ctx_search", "ctx_reset", "ctx_list"],
+            "tools": [
+                "ctx_get", "ctx_update", "ctx_note", "ctx_history", "ctx_link",
+                "ctx_map", "ctx_search", "ctx_reset", "ctx_list",
+            ],
         })
         return
 

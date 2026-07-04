@@ -1,11 +1,12 @@
 """SQLite storage layer for ctx.
 
 Stores project context in four buckets: WHAT, DONE, NOW, MAP.
-Everything is local — one .db file per installation.
+Everything is local - one .db file per installation.
 """
 
 import sqlite3
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -14,6 +15,65 @@ from typing import Optional
 # Default DB location: ~/.ctx/ctx.db
 DEFAULT_DB_DIR = Path.home() / ".ctx"
 DEFAULT_DB_PATH = DEFAULT_DB_DIR / "ctx.db"
+
+_MAP_BULLET_RE = re.compile(r"^\s*[-*]\s*")
+_MAP_SPLIT_RE = re.compile(r"\s+(?:--|-)\s+")
+
+
+def _normalize_path_key(path: str) -> str:
+    """Return a stable key for deduping file paths."""
+    candidate = path.strip().strip('"').strip("'")
+    if not candidate:
+        return ""
+    return candidate.replace("/", "\\").rstrip("\\").lower()
+
+
+def _parse_map_line(line: str) -> tuple[str, str]:
+    """Parse a MAP line into (path, note)."""
+    clean = _MAP_BULLET_RE.sub("", line.strip())
+    if not clean:
+        return "", ""
+
+    parts = _MAP_SPLIT_RE.split(clean, maxsplit=1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+
+    if "\u2014" in clean:
+        left, right = clean.split("\u2014", 1)
+        return left.strip(), right.strip()
+
+    return clean.strip(), ""
+
+
+def normalize_map_content(map_content: str) -> str:
+    """Canonicalize MAP content while preserving first-seen order."""
+    ordered: dict[str, tuple[str, str]] = {}
+    for line in map_content.splitlines():
+        path_part, note = _parse_map_line(line)
+        key = _normalize_path_key(path_part)
+        if not key:
+            continue
+        if key not in ordered:
+            ordered[key] = (path_part, note)
+        elif note and not ordered[key][1]:
+            ordered[key] = (ordered[key][0], note)
+
+    lines = []
+    for path_part, note in ordered.values():
+        if note:
+            lines.append(f"- {path_part} - {note}")
+        else:
+            lines.append(f"- {path_part}")
+    return "\n".join(lines)
+
+
+def merge_map_content(existing_map: str, new_map: str) -> str:
+    """Merge MAP content with stable ordering and deduplication."""
+    if not existing_map.strip():
+        return normalize_map_content(new_map)
+    if not new_map.strip():
+        return normalize_map_content(existing_map)
+    return normalize_map_content(existing_map + "\n" + new_map)
 
 
 def _get_db_path() -> Path:
@@ -53,6 +113,17 @@ def get_connection() -> sqlite3.Connection:
             project     TEXT NOT NULL,
             tool_name   TEXT NOT NULL DEFAULT 'unknown',
             summary     TEXT NOT NULL,
+            timestamp   TEXT NOT NULL,
+            FOREIGN KEY (project) REFERENCES projects(name) ON DELETE CASCADE
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS project_messages (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project     TEXT NOT NULL,
+            author      TEXT NOT NULL DEFAULT 'user',
+            message     TEXT NOT NULL,
             timestamp   TEXT NOT NULL,
             FOREIGN KEY (project) REFERENCES projects(name) ON DELETE CASCADE
         )
@@ -133,6 +204,7 @@ def update_project(
 ) -> dict:
     """Update a project's context buckets after merge."""
     conn = get_connection()
+    map_ = normalize_map_content(map_)
     ts = datetime.now(timezone.utc).isoformat()
 
     if repo_path is not None:
@@ -169,6 +241,7 @@ def update_project(
 def update_project_map(name: str, map_content: str) -> dict:
     """Update only the MAP bucket for a project (for ctx_map tool)."""
     conn = get_connection()
+    map_content = normalize_map_content(map_content)
     ts = datetime.now(timezone.utc).isoformat()
 
     cursor = conn.execute(
@@ -184,6 +257,81 @@ def update_project_map(name: str, map_content: str) -> dict:
     result = get_project(name, conn)
     conn.close()
     return result
+
+
+def add_project_message(name: str, message: str, author: str = "user") -> dict:
+    """Store a user-authored project note/message."""
+    conn = get_connection()
+    ts = datetime.now(timezone.utc).isoformat()
+
+    row = conn.execute("SELECT name FROM projects WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        conn.close()
+        return {"error": f"Project '{name}' not found."}
+
+    cursor = conn.execute(
+        """INSERT INTO project_messages (project, author, message, timestamp)
+           VALUES (?, ?, ?, ?)""",
+        (name, author or "user", message, ts),
+    )
+    conn.commit()
+
+    result = {
+        "id": cursor.lastrowid,
+        "project": name,
+        "author": author or "user",
+        "message": message,
+        "timestamp": ts,
+    }
+    conn.close()
+    return result
+
+
+def list_project_history(name: str, limit: int = 20) -> dict:
+    """Return recent update summaries and user messages for one project."""
+    conn = get_connection()
+    project = get_project(name, conn)
+    if "error" in project:
+        conn.close()
+        return project
+
+    safe_limit = max(1, min(int(limit or 20), 100))
+    updates = conn.execute(
+        """SELECT tool_name, summary, timestamp FROM update_log
+           WHERE project = ?
+           ORDER BY timestamp DESC
+           LIMIT ?""",
+        (name, safe_limit),
+    ).fetchall()
+    messages = conn.execute(
+        """SELECT id, author, message, timestamp FROM project_messages
+           WHERE project = ?
+           ORDER BY timestamp DESC
+           LIMIT ?""",
+        (name, safe_limit),
+    ).fetchall()
+    conn.close()
+
+    return {
+        "project": name,
+        "updates": [
+            {
+                "tool_name": r["tool_name"],
+                "summary": r["summary"],
+                "timestamp": r["timestamp"],
+            }
+            for r in updates
+        ],
+        "messages": [
+            {
+                "id": r["id"],
+                "author": r["author"],
+                "message": r["message"],
+                "timestamp": r["timestamp"],
+            }
+            for r in messages
+        ],
+    }
 
 
 def reset_project(name: str) -> dict:
@@ -202,6 +350,7 @@ def reset_project(name: str) -> dict:
 
     # Also clear the log
     conn.execute("DELETE FROM update_log WHERE project = ?", (name,))
+    conn.execute("DELETE FROM project_messages WHERE project = ?", (name,))
     conn.commit()
     conn.close()
     return {"status": "reset", "project": name}
@@ -286,6 +435,31 @@ def search_logs(query: str) -> list[dict]:
             "project": r["project"],
             "tool_name": r["tool_name"],
             "summary": r["summary"],
+            "timestamp": r["timestamp"],
+        }
+        for r in rows
+    ]
+
+
+def search_messages(query: str) -> list[dict]:
+    """Search user-authored project messages."""
+    conn = get_connection()
+    pattern = f"%{query}%"
+    rows = conn.execute(
+        """SELECT project, id, author, message, timestamp FROM project_messages
+           WHERE message LIKE ?
+           ORDER BY timestamp DESC
+           LIMIT 20""",
+        (pattern,),
+    ).fetchall()
+    conn.close()
+
+    return [
+        {
+            "project": r["project"],
+            "id": r["id"],
+            "author": r["author"],
+            "message": r["message"],
             "timestamp": r["timestamp"],
         }
         for r in rows

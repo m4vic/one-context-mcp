@@ -1,8 +1,8 @@
-"""Git integration for ctx — Combined Context.
+"""Git integration for ctx - Combined Context.
 
 Detects branch, recent commits, and changed files for a project's repo.
 All functions return None gracefully if git is unavailable or the path
-is not a git repository. Zero dependencies — uses subprocess only.
+is not a git repository. Zero dependencies - uses subprocess only.
 """
 
 import subprocess
