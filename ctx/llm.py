@@ -1,19 +1,20 @@
 """Context merging for ctx - Combined Context.
 
-Four merge modes (selected with CTX_MERGE_MODE):
+Merge modes (selected with CTX_MERGE_MODE):
 
 1. LOCAL (default) - Smart rule-based merge. No API keys, no models,
    no internet. Always works. This is the foundation.
 
 2. OLLAMA (local LLM) - Uses any model running on your local Ollama.
-   Set CTX_OLLAMA_MODEL=llama3.2 (or any model you have pulled).
-   Still 100% local, still zero API keys.
+   Set CTX_OLLAMA_MODEL=llama3.2 (or leave unset to auto-use whatever
+   model you already have pulled). Still 100% local, still zero API keys.
 
-3. CLOUD API (optional) - Claude, OpenAI, or any OpenAI-compatible API.
-   Set ANTHROPIC_API_KEY or OPENAI_API_KEY + OPENAI_MODEL.
-   For custom endpoints: OPENAI_BASE_URL=http://your-api/v1
+3. CLOUD API (optional) - Claude, Gemini, OpenAI, or any OpenAI-compatible
+   API. Set ANTHROPIC_API_KEY, GEMINI_API_KEY (+ CTX_GEMINI_MODEL), or
+   OPENAI_API_KEY (+ OPENAI_MODEL). For custom OpenAI-compatible endpoints:
+   OPENAI_BASE_URL=http://your-api/v1
 
-Set CTX_MERGE_MODE=auto to try Ollama > Anthropic > OpenAI > local fallback.
+Set CTX_MERGE_MODE=auto to try Ollama > Anthropic > Gemini > OpenAI > local.
 """
 
 import os
@@ -26,7 +27,7 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError
 
 
-_VALID_MERGE_MODES = {"local", "auto", "ollama", "anthropic", "openai"}
+_VALID_MERGE_MODES = {"local", "auto", "ollama", "anthropic", "openai", "gemini"}
 
 
 def _get_merge_mode() -> str:
@@ -86,6 +87,22 @@ def _build_user_message(
 {session_summary}"""
 
 
+def _coerce_bucket_value(value, fallback: str) -> str:
+    """Coerce a bucket value to a plain string.
+
+    Weaker/local models (small Ollama models especially) often ignore the
+    "respond with a JSON string" instruction and return a list of bullet
+    items instead. Join those into the newline-bulleted string format the
+    rest of the pipeline expects rather than crashing downstream in
+    normalize_map_content/database writes.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(f"- {item}" if not str(item).lstrip().startswith("-") else str(item) for item in value)
+    return fallback
+
+
 def _parse_llm_response(text: str, current_what: str, current_done: str,
                          current_now: str, current_map: str) -> Optional[dict]:
     """Parse JSON from LLM response, handling markdown fences."""
@@ -102,10 +119,10 @@ def _parse_llm_response(text: str, current_what: str, current_done: str,
     try:
         result = json.loads(text)
         return {
-            "what": result.get("what", current_what),
-            "done": result.get("done", current_done),
-            "now": result.get("now", current_now),
-            "map": result.get("map", current_map),
+            "what": _coerce_bucket_value(result.get("what", current_what), current_what),
+            "done": _coerce_bucket_value(result.get("done", current_done), current_done),
+            "now": _coerce_bucket_value(result.get("now", current_now), current_now),
+            "map": _coerce_bucket_value(result.get("map", current_map), current_map),
         }
     except (json.JSONDecodeError, KeyError):
         return None
@@ -266,6 +283,24 @@ def _local_merge(
 # 2. OLLAMA MERGE (local LLM - zero API keys, runs on your machine)
 # ---------------------------------------------------------------------------
 
+def _detect_ollama_model(base_url: str) -> Optional[str]:
+    """Return the first locally pulled Ollama model, or None if none/unreachable.
+
+    Lets a user turn on Ollama merging with just CTX_MERGE_MODE=ollama - no need
+    to also name a model - by asking Ollama what it already has pulled.
+    """
+    try:
+        req = Request(f"{base_url}/api/tags", headers={"Accept": "application/json"})
+        with urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        models = data.get("models") or []
+        if models:
+            return models[0].get("name")
+    except (URLError, TimeoutError, json.JSONDecodeError, KeyError, OSError):
+        return None
+    return None
+
+
 def _ollama_merge(
     current_what: str, current_done: str, current_now: str,
     current_map: str, session_summary: str, tool_name: str, repo_path: str = "",
@@ -273,14 +308,15 @@ def _ollama_merge(
     """Use a local Ollama model for intelligent merge.
 
     Config via env vars:
-        CTX_OLLAMA_MODEL  - model name (e.g. llama3.2, mistral, gemma2)
+        CTX_OLLAMA_MODEL  - model name (e.g. llama3.2, mistral, gemma2).
+                            If unset, the first locally pulled model is used.
         CTX_OLLAMA_URL    - Ollama API URL (default: http://localhost:11434)
     """
-    model = os.environ.get("CTX_OLLAMA_MODEL")
+    base_url = os.environ.get("CTX_OLLAMA_URL", "http://localhost:11434")
+    model = os.environ.get("CTX_OLLAMA_MODEL") or _detect_ollama_model(base_url)
     if not model:
         return None
 
-    base_url = os.environ.get("CTX_OLLAMA_URL", "http://localhost:11434")
     url = f"{base_url}/api/chat"
 
     user_msg = _build_user_message(
@@ -334,7 +370,7 @@ def _anthropic_merge(
             session_summary, tool_name, repo_path,
         )
         response = client.messages.create(
-            model=os.environ.get("CTX_ANTHROPIC_MODEL", "claude-haiku-4-20250414"),
+            model=os.environ.get("CTX_ANTHROPIC_MODEL", "claude-haiku-4-5"),
             max_tokens=2048,
             system=MERGE_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_msg}],
@@ -351,7 +387,54 @@ def _anthropic_merge(
 
 
 # ---------------------------------------------------------------------------
-# 4. OPENAI-COMPATIBLE MERGE (any API - OpenAI, Groq, Together, etc.)
+# 4. GEMINI MERGE (optional cloud - needs GEMINI_API_KEY)
+# ---------------------------------------------------------------------------
+
+def _gemini_merge(
+    current_what: str, current_done: str, current_now: str,
+    current_map: str, session_summary: str, tool_name: str, repo_path: str = "",
+) -> Optional[dict]:
+    """Use Google Gemini for merge. Only if GEMINI_API_KEY is set.
+
+    Config via env vars:
+        GEMINI_API_KEY   - API key
+        CTX_GEMINI_MODEL - model name (default: gemini-2.0-flash)
+    """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return None
+
+    model = os.environ.get("CTX_GEMINI_MODEL", "gemini-2.0-flash")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
+    user_msg = _build_user_message(
+        current_what, current_done, current_now, current_map,
+        session_summary, tool_name, repo_path,
+    )
+
+    payload = json.dumps({
+        "system_instruction": {"parts": [{"text": MERGE_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
+        "generationConfig": {"temperature": 0.1},
+    }).encode()
+
+    try:
+        req = Request(url, data=payload, headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            result = _parse_llm_response(text, current_what, current_done, current_now, current_map)
+            if result:
+                return result
+            print("[ctx] Gemini response wasn't valid JSON, using local merge.")
+            return None
+    except Exception as e:
+        print(f"[ctx] Gemini merge failed ({e}), using local merge.")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 5. OPENAI-COMPATIBLE MERGE (any API - OpenAI, Groq, Together, etc.)
 # ---------------------------------------------------------------------------
 
 def _openai_merge(
@@ -430,7 +513,8 @@ def merge_context(
         "ollama": [_ollama_merge],
         "anthropic": [_anthropic_merge],
         "openai": [_openai_merge],
-        "auto": [_ollama_merge, _anthropic_merge, _openai_merge],
+        "gemini": [_gemini_merge],
+        "auto": [_ollama_merge, _anthropic_merge, _gemini_merge, _openai_merge],
     }[mode]
 
     for provider in providers:

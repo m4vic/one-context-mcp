@@ -93,6 +93,10 @@ def get_connection() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # Wait (instead of erroring) if another tool holds the write lock. This,
+    # together with BEGIN IMMEDIATE in atomic_merge_update, is what makes
+    # concurrent updates from multiple AI tools safe against lost writes.
+    conn.execute("PRAGMA busy_timeout=5000")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS projects (
@@ -125,6 +129,18 @@ def get_connection() -> sqlite3.Connection:
             author      TEXT NOT NULL DEFAULT 'user',
             message     TEXT NOT NULL,
             timestamp   TEXT NOT NULL,
+            FOREIGN KEY (project) REFERENCES projects(name) ON DELETE CASCADE
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bugs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project     TEXT NOT NULL,
+            description TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'open',
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL,
             FOREIGN KEY (project) REFERENCES projects(name) ON DELETE CASCADE
         )
     """)
@@ -238,6 +254,78 @@ def update_project(
     return result
 
 
+def atomic_merge_update(
+    name: str,
+    merge_fn,
+    tool_name: str,
+    summary: str,
+    repo_path: Optional[str] = None,
+) -> dict:
+    """Atomically read a project's context, merge, and write it back.
+
+    `merge_fn` receives the current context dict (what/done/now/map/repo_path)
+    and returns a dict with the merged what/done/now/map. The whole read →
+    merge → write runs inside a single BEGIN IMMEDIATE transaction so two AI
+    tools calling ctx_update on the same project can't clobber each other
+    (no lost updates).
+
+    Note: in local merge mode `merge_fn` is instant, so holding the write
+    lock across it is fine. LLM merge modes do network I/O inside the lock;
+    that's acceptable because local is the default and LLM modes are opt-in.
+    """
+    conn = get_connection()
+    conn.isolation_level = None  # manual transaction control
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM projects WHERE name = ?", (name,)
+        ).fetchone()
+        if row is None:
+            conn.execute("ROLLBACK")
+            conn.close()
+            return {"error": f"Project '{name}' not found."}
+
+        current = {
+            "what": row["what"],
+            "done": row["done"],
+            "now": row["now"],
+            "map": row["map"],
+            "repo_path": row["repo_path"],
+        }
+        merged = merge_fn(current)
+        map_ = normalize_map_content(merged.get("map", current["map"]))
+        ts = datetime.now(timezone.utc).isoformat()
+
+        if repo_path is not None:
+            conn.execute(
+                """UPDATE projects
+                   SET what = ?, done = ?, now = ?, map = ?, repo_path = ?, updated_at = ?
+                   WHERE name = ?""",
+                (merged["what"], merged["done"], merged["now"], map_, repo_path, ts, name),
+            )
+        else:
+            conn.execute(
+                """UPDATE projects
+                   SET what = ?, done = ?, now = ?, map = ?, updated_at = ?
+                   WHERE name = ?""",
+                (merged["what"], merged["done"], merged["now"], map_, ts, name),
+            )
+
+        conn.execute(
+            "INSERT INTO update_log (project, tool_name, summary, timestamp) VALUES (?, ?, ?, ?)",
+            (name, tool_name, summary, ts),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        conn.close()
+        raise
+
+    result = get_project(name, conn)
+    conn.close()
+    return result
+
+
 def update_project_map(name: str, map_content: str) -> dict:
     """Update only the MAP bucket for a project (for ctx_map tool)."""
     conn = get_connection()
@@ -285,6 +373,100 @@ def add_project_message(name: str, message: str, author: str = "user") -> dict:
     }
     conn.close()
     return result
+
+
+_VALID_BUG_STATUSES = {"open", "fixed"}
+
+
+def _bug_row_to_dict(row) -> dict:
+    return {
+        "id": row["id"],
+        "project": row["project"],
+        "description": row["description"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def add_bug(name: str, description: str) -> dict:
+    """Record a new open bug for a project."""
+    description = (description or "").strip()
+    if not description:
+        return {"error": "Bug description must not be empty."}
+
+    conn = get_connection()
+    row = conn.execute("SELECT name FROM projects WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        conn.close()
+        return {"error": f"Project '{name}' not found."}
+
+    ts = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        """INSERT INTO bugs (project, description, status, created_at, updated_at)
+           VALUES (?, ?, 'open', ?, ?)""",
+        (name, description, ts, ts),
+    )
+    conn.commit()
+    result = {
+        "id": cursor.lastrowid,
+        "project": name,
+        "description": description,
+        "status": "open",
+        "created_at": ts,
+        "updated_at": ts,
+    }
+    conn.close()
+    return result
+
+
+def set_bug_status(name: str, bug_id: int, status: str) -> dict:
+    """Update a bug's status (open/fixed)."""
+    if status not in _VALID_BUG_STATUSES:
+        return {"error": f"status must be one of {sorted(_VALID_BUG_STATUSES)}."}
+
+    conn = get_connection()
+    ts = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        "UPDATE bugs SET status = ?, updated_at = ? WHERE id = ? AND project = ?",
+        (status, ts, bug_id, name),
+    )
+    if cursor.rowcount == 0:
+        conn.close()
+        return {"error": f"Bug #{bug_id} not found for project '{name}'."}
+    conn.commit()
+    row = conn.execute("SELECT * FROM bugs WHERE id = ?", (bug_id,)).fetchone()
+    conn.close()
+    return _bug_row_to_dict(row)
+
+
+def list_bugs(name: str, status: Optional[str] = None) -> list[dict]:
+    """List a project's bugs, optionally filtered by status. Open bugs first."""
+    conn = get_connection()
+    if status:
+        rows = conn.execute(
+            "SELECT * FROM bugs WHERE project = ? AND status = ? ORDER BY id",
+            (name, status),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT * FROM bugs WHERE project = ?
+               ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, id""",
+            (name,),
+        ).fetchall()
+    conn.close()
+    return [_bug_row_to_dict(r) for r in rows]
+
+
+def count_bugs(name: str, status: str) -> int:
+    """Count a project's bugs with a given status."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM bugs WHERE project = ? AND status = ?",
+        (name, status),
+    ).fetchone()
+    conn.close()
+    return row["n"] if row else 0
 
 
 def list_project_history(name: str, limit: int = 20) -> dict:
@@ -464,3 +646,18 @@ def search_messages(query: str) -> list[dict]:
         }
         for r in rows
     ]
+
+
+def search_bugs(query: str) -> list[dict]:
+    """Search bug descriptions across all projects."""
+    conn = get_connection()
+    pattern = f"%{query}%"
+    rows = conn.execute(
+        """SELECT * FROM bugs
+           WHERE description LIKE ?
+           ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, updated_at DESC
+           LIMIT 20""",
+        (pattern,),
+    ).fetchall()
+    conn.close()
+    return [_bug_row_to_dict(r) for r in rows]

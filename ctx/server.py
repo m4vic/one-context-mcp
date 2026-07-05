@@ -22,13 +22,19 @@ from ctx.database import (
     get_project,
     update_project,
     update_project_map,
+    atomic_merge_update,
     reset_project,
     list_projects,
     init_project,
     search_projects,
     search_logs,
     search_messages,
+    search_bugs,
     add_project_message,
+    add_bug,
+    set_bug_status,
+    list_bugs,
+    count_bugs,
     list_project_history,
     merge_map_content,
     normalize_map_content,
@@ -337,6 +343,41 @@ async def handle_list_tools() -> list[Tool]:
                 "properties": {},
             },
         ),
+        Tool(
+            name="ctx_bug",
+            description=(
+                "Track bugs for a project. Three uses based on which fields you send:\n"
+                "- List bugs: send only 'project' (open bugs first).\n"
+                "- Add a bug: send 'project' and 'description' (created as open).\n"
+                "- Update a bug: send 'project', 'bug_id', and 'status' "
+                "('open' or 'fixed').\n"
+                "Open bugs are also surfaced automatically on ctx_get so any AI "
+                "tool loading the project sees what is still broken."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project name / namespace",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Bug description. Provide this to add a new open bug.",
+                    },
+                    "bug_id": {
+                        "type": "integer",
+                        "description": "ID of an existing bug to update. Use with 'status'.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["open", "fixed"],
+                        "description": "New status when updating an existing bug.",
+                    },
+                },
+                "required": ["project"],
+            },
+        ),
     ]
 
 
@@ -353,6 +394,8 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 if guard:
                     result["safety"] = guard
                 result = _with_git_info(result)
+                result["bugs"] = list_bugs(project, status="open")
+                result["bugs_fixed_count"] = count_bugs(project, "fixed")
 
         elif name == "ctx_strict_get":
             project = arguments["project"]
@@ -364,6 +407,8 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                     result = guard
                 else:
                     result = _with_git_info(result)
+                    result["bugs"] = list_bugs(project, status="open")
+                    result["bugs_fixed_count"] = count_bugs(project, "fixed")
 
         elif name == "ctx_update":
             project = arguments["project"]
@@ -371,38 +416,34 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
             tool_name = arguments.get("tool_name", "unknown")
             repo_path = arguments.get("repo_path")
 
-            # Get current context
+            # Get current context (for guard + auto-init decision)
             current = get_project(project)
             if "error" in current:
                 # Auto-init the project if it doesn't exist
                 logger.info(f"Auto-initializing project '{project}'")
                 init_project(project, repo_path=repo_path or "")
-                current = {"what": "", "done": "", "now": "", "map": ""}
             else:
                 guard = _repo_guard(project, current.get("repo_path", ""), repo_path, strict=True)
                 if guard and "error" in guard:
                     result = guard
                     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
-            # Merge (local by default, LLM-enhanced if configured)
-            repo_scope = repo_path or current.get("repo_path", "")
-            merged = merge_context(
-                current_what=current.get("what", ""),
-                current_done=current.get("done", ""),
-                current_now=current.get("now", ""),
-                current_map=current.get("map", ""),
-                session_summary=session_summary,
-                tool_name=tool_name,
-                repo_path=repo_scope,
-            )
+            # Merge (local by default, LLM-enhanced if configured) inside a
+            # single transaction so concurrent updates can't lose each other.
+            def _merge(cur: dict) -> dict:
+                return merge_context(
+                    current_what=cur.get("what", ""),
+                    current_done=cur.get("done", ""),
+                    current_now=cur.get("now", ""),
+                    current_map=cur.get("map", ""),
+                    session_summary=session_summary,
+                    tool_name=tool_name,
+                    repo_path=repo_path or cur.get("repo_path", ""),
+                )
 
-            # Save
-            result = update_project(
+            result = atomic_merge_update(
                 name=project,
-                what=merged["what"],
-                done=merged["done"],
-                now=merged["now"],
-                map_=merged["map"],
+                merge_fn=_merge,
                 tool_name=tool_name,
                 summary=session_summary,
                 repo_path=repo_path,
@@ -463,22 +504,21 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                     }
                 else:
                     session_summary = f"User note from {author}: {message}"
-                    repo_scope = repo_path or current.get("repo_path", "")
-                    merged = merge_context(
-                        current_what=current.get("what", ""),
-                        current_done=current.get("done", ""),
-                        current_now=current.get("now", ""),
-                        current_map=current.get("map", ""),
-                        session_summary=session_summary,
-                        tool_name=f"user:{author}",
-                        repo_path=repo_scope,
-                    )
-                    context = update_project(
+
+                    def _merge_note(cur: dict) -> dict:
+                        return merge_context(
+                            current_what=cur.get("what", ""),
+                            current_done=cur.get("done", ""),
+                            current_now=cur.get("now", ""),
+                            current_map=cur.get("map", ""),
+                            session_summary=session_summary,
+                            tool_name=f"user:{author}",
+                            repo_path=repo_path or cur.get("repo_path", ""),
+                        )
+
+                    context = atomic_merge_update(
                         name=project,
-                        what=merged["what"],
-                        done=merged["done"],
-                        now=merged["now"],
-                        map_=merged["map"],
+                        merge_fn=_merge_note,
                         tool_name=f"user:{author}",
                         summary=session_summary,
                         repo_path=repo_path,
@@ -506,12 +546,17 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
             project_matches = search_projects(query)
             log_matches = search_logs(query)
             message_matches = search_messages(query)
+            bug_matches = search_bugs(query)
             result = {
                 "query": query,
                 "projects": project_matches,
                 "history": log_matches,
                 "messages": message_matches,
-                "total_matches": len(project_matches) + len(log_matches) + len(message_matches),
+                "bugs": bug_matches,
+                "total_matches": (
+                    len(project_matches) + len(log_matches)
+                    + len(message_matches) + len(bug_matches)
+                ),
             }
 
         elif name == "ctx_reset":
@@ -519,6 +564,33 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "ctx_list":
             result = list_projects()
+
+        elif name == "ctx_bug":
+            project = arguments["project"]
+            description = arguments.get("description")
+            bug_id = arguments.get("bug_id")
+            status = arguments.get("status")
+
+            if bug_id is not None:
+                # Update an existing bug's status
+                if status is None:
+                    result = {"error": "Provide 'status' ('open' or 'fixed') to update a bug."}
+                else:
+                    result = set_bug_status(project, int(bug_id), status)
+            elif description:
+                # Add a new bug (auto-init the project if needed)
+                if "error" in get_project(project):
+                    init_project(project)
+                result = add_bug(project, description)
+            else:
+                # List bugs for the project
+                if "error" in get_project(project):
+                    result = {"error": f"Project '{project}' not found."}
+                else:
+                    result = {
+                        "project": project,
+                        "bugs": list_bugs(project),
+                    }
 
         else:
             result = {"error": f"Unknown tool: {name}"}
@@ -615,7 +687,7 @@ async def app(scope, receive, send):
             "tools": [
                 "ctx_get", "ctx_strict_get", "ctx_update", "ctx_note",
                 "ctx_history", "ctx_link", "ctx_map", "ctx_search",
-                "ctx_reset", "ctx_list",
+                "ctx_reset", "ctx_list", "ctx_bug",
             ],
         })
         return
