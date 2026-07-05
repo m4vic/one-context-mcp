@@ -131,9 +131,13 @@ MAP entries are normalized and deduplicated. When a project is linked to a `repo
 | `ctx_link(project, repo_path)` | Create/link a project to a workspace root for strict file scoping |
 | `ctx_resolve(repo_path)` | Reverse lookup: which project is linked to this folder (works from subfolders too) |
 | `ctx_bug(project, description?, bug_id?, status?)` | Add a bug, mark one fixed, or list a project's bugs |
+| `ctx_export(project?, format?)` | Export context as JSON (re-importable) or Markdown; omit project for all |
+| `ctx_import(data, mode?)` | Restore/merge context from a ctx_export JSON |
 | `ctx_search(query)` | Search all projects, update history, user notes, and bugs |
-| `ctx_reset(project)` | Clear one project's context |
-| `ctx_list()` | List tracked projects |
+| `ctx_reset(project)` | Clear one project's context, history, notes, and bugs |
+| `ctx_list()` | List tracked projects with their linked folders |
+
+`ctx_get` also accepts `view: "brief"` to return only the recent slice of DONE when the calling session is low on context.
 
 ---
 
@@ -143,12 +147,38 @@ MAP entries are normalized and deduplicated. When a project is linked to a `repo
 ctx status [project]          # View current context or list projects
 ctx init <project> --path .   # Create/link project to repo path
 ctx search <query>            # Search across projects and history
+ctx export <project> -o f.json   # Backup one project (--all for everything, --format md for readable)
+ctx import f.json             # Restore/merge an exported backup
 ctx reset <project>           # Clear a project's context
 ctx delete <project>          # Permanently delete a project
 ctx list                      # List all projects
-ctx serve --port 7337         # Start HTTP/SSE server
+ctx serve --port 7337         # Start HTTP/SSE server (localhost only by default)
 ctx stdio                     # Start stdio MCP server
 ```
+
+---
+
+## Backup & Portability
+
+Your entire context lives in one SQLite file (`~/.ctx/ctx.db`). To back it up, commit it to a repo, or move machines:
+
+```bash
+ctx export myproject -o context-backup.json   # per-project backup
+ctx export --all -o all-context.json          # everything
+ctx import context-backup.json                # merge into existing (safe, idempotent)
+ctx import context-backup.json --mode replace # overwrite buckets
+```
+
+Any MCP client can do the same via the `ctx_export` / `ctx_import` tools.
+
+---
+
+## Security
+
+- **stdio mode (the default setup) has no network surface.**
+- `ctx serve` binds **localhost only** by default (changed in 0.4.0; previously `0.0.0.0`).
+- To expose HTTP mode on a network, set a token first: `CTX_AUTH_TOKEN=<secret> ctx serve --host 0.0.0.0`. Clients must then send `Authorization: Bearer <secret>`. Without the token the server warns loudly.
+- With auth enabled, `/health` hides the tool list and CORS is restricted to localhost origins.
 
 ---
 

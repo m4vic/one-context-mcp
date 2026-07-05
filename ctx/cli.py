@@ -2,7 +2,6 @@ import sys
 if sys.platform == 'win32':
     import asyncio
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-import sys
 import anyio
 import click
 from ctx.database import (
@@ -20,17 +19,25 @@ def cli():
 
 @cli.command()
 @click.option("--port", default=7337, help="Port to run the server on")
-@click.option("--host", default="0.0.0.0", help="Host to bind to")
+@click.option("--host", default="127.0.0.1", show_default=True,
+              help="Host to bind to. Use 0.0.0.0 to expose on the network "
+                   "(set CTX_AUTH_TOKEN if you do).")
 def serve(port, host):
-    """Start the HTTP/SSE server."""
+    """Start the HTTP/SSE server (binds to localhost only by default)."""
+    import os
     import uvicorn
+    auth_enabled = bool(os.environ.get("CTX_AUTH_TOKEN"))
     print(f"[ctx] server starting on http://{host}:{port}")
     print(f"   SSE endpoint:     http://localhost:{port}/sse")
     print(f"   Messages endpoint: http://localhost:{port}/messages/")
-    print(f"   Health check:      http://localhost:{port}/health\n")
+    print(f"   Health check:      http://localhost:{port}/health")
+    print(f"   Auth:              {'Bearer token (CTX_AUTH_TOKEN)' if auth_enabled else 'disabled'}\n")
+    if host not in ("127.0.0.1", "localhost") and not auth_enabled:
+        print("[!] WARNING: binding beyond localhost without CTX_AUTH_TOKEN -")
+        print("    anyone on the network can read and write your context DB.\n")
     print("Add to your MCP config:")
     print(f'   {{"mcpServers": {{"ctx": {{"url": "http://localhost:{port}/sse"}}}}}}\n')
-    
+
     uvicorn.run("ctx.server:app", host=host, port=port, log_level="info")
 
 @cli.command()
@@ -130,6 +137,66 @@ def delete(project):
         print(f"[!] {result['error']}")
     else:
         print(f"[OK] Project '{project}' deleted.")
+
+@cli.command()
+@click.argument("project", required=False)
+@click.option("--all", "export_all_flag", is_flag=True, help="Export every project")
+@click.option("-o", "--output", type=click.Path(), default=None, help="Write to file instead of stdout")
+@click.option("--format", "fmt", type=click.Choice(["json", "md"]), default="json", show_default=True)
+def export(project, export_all_flag, output, fmt):
+    """Export project context (backup / commit to repo / move machines)."""
+    import json as _json
+    from ctx.database import export_project, export_all, render_project_markdown
+
+    if not project and not export_all_flag:
+        print("[!] Give a project name or --all.")
+        return
+    data = export_all() if export_all_flag else export_project(project)
+    if "error" in data:
+        print(f"[!] {data['error']}")
+        return
+
+    if fmt == "md":
+        if "projects" in data:
+            text = "\n---\n\n".join(render_project_markdown(p) for p in data["projects"])
+        else:
+            text = render_project_markdown(data)
+    else:
+        text = _json.dumps(data, indent=2)
+
+    if output:
+        with open(output, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"[OK] Exported to {output}")
+    else:
+        print(text)
+
+
+@cli.command(name="import")
+@click.argument("file", type=click.Path(exists=True))
+@click.option("--mode", type=click.Choice(["merge", "replace"]), default="merge", show_default=True)
+def import_cmd(file, mode):
+    """Import context from a ctx export JSON file."""
+    import json as _json
+    from ctx.database import import_project
+
+    with open(file, encoding="utf-8") as f:
+        try:
+            payload = _json.load(f)
+        except _json.JSONDecodeError as e:
+            print(f"[!] Not valid JSON: {e}")
+            return
+
+    projects = payload["projects"] if isinstance(payload, dict) and "projects" in payload else [payload]
+    for p in projects:
+        result = import_project(p, mode=mode)
+        if "error" in result:
+            print(f"[!] {result['error']}")
+        else:
+            stats = result.get("imported", {})
+            print(f"[OK] Imported '{result['project']}' ({mode}): "
+                  f"+{stats.get('updates', 0)} updates, +{stats.get('messages', 0)} notes, +{stats.get('bugs', 0)} bugs")
+
 
 @cli.command()
 @click.argument("query")

@@ -76,6 +76,44 @@ def merge_map_content(existing_map: str, new_map: str) -> str:
     return normalize_map_content(existing_map + "\n" + new_map)
 
 
+def _bucket_cap(env_var: str, default: int) -> int:
+    """Read a size cap from the environment, falling back on bad values."""
+    raw = os.environ.get(env_var, "")
+    try:
+        value = int(raw)
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+def trim_bucket(text: str, max_chars: int) -> str:
+    """Trim oldest whole lines until the bucket fits max_chars.
+
+    Character-based (line counts don't bound size - one long line defeats
+    them). Keeps the newest lines, which sit at the bottom of every bucket.
+    """
+    if len(text) <= max_chars:
+        return text
+    lines = text.splitlines()
+    while lines and len("\n".join(lines)) > max_chars:
+        lines.pop(0)
+    if lines:
+        return "\n".join(lines)
+    # Single line larger than the cap: keep its tail
+    return text[-max_chars:]
+
+
+def _apply_caps(what: str, done: str, now: str, map_: str) -> tuple[str, str, str, str]:
+    bucket_cap = _bucket_cap("CTX_MAX_BUCKET_CHARS", 12000)
+    map_cap = _bucket_cap("CTX_MAX_MAP_CHARS", 4000)
+    return (
+        trim_bucket(what, bucket_cap),
+        trim_bucket(done, bucket_cap),
+        trim_bucket(now, bucket_cap),
+        trim_bucket(map_, map_cap),
+    )
+
+
 def _get_db_path() -> Path:
     """Get the database path, respecting CTX_DB_PATH env var."""
     custom = os.environ.get("CTX_DB_PATH")
@@ -221,6 +259,7 @@ def update_project(
     """Update a project's context buckets after merge."""
     conn = get_connection()
     map_ = normalize_map_content(map_)
+    what, done, now, map_ = _apply_caps(what, done, now, map_)
     ts = datetime.now(timezone.utc).isoformat()
 
     if repo_path is not None:
@@ -294,6 +333,7 @@ def atomic_merge_update(
         }
         merged = merge_fn(current)
         map_ = normalize_map_content(merged.get("map", current["map"]))
+        what, done, now, map_ = _apply_caps(merged["what"], merged["done"], merged["now"], map_)
         ts = datetime.now(timezone.utc).isoformat()
 
         if repo_path is not None:
@@ -301,14 +341,14 @@ def atomic_merge_update(
                 """UPDATE projects
                    SET what = ?, done = ?, now = ?, map = ?, repo_path = ?, updated_at = ?
                    WHERE name = ?""",
-                (merged["what"], merged["done"], merged["now"], map_, repo_path, ts, name),
+                (what, done, now, map_, repo_path, ts, name),
             )
         else:
             conn.execute(
                 """UPDATE projects
                    SET what = ?, done = ?, now = ?, map = ?, updated_at = ?
                    WHERE name = ?""",
-                (merged["what"], merged["done"], merged["now"], map_, ts, name),
+                (what, done, now, map_, ts, name),
             )
 
         conn.execute(
@@ -330,6 +370,7 @@ def update_project_map(name: str, map_content: str) -> dict:
     """Update only the MAP bucket for a project (for ctx_map tool)."""
     conn = get_connection()
     map_content = normalize_map_content(map_content)
+    map_content = trim_bucket(map_content, _bucket_cap("CTX_MAX_MAP_CHARS", 4000))
     ts = datetime.now(timezone.utc).isoformat()
 
     cursor = conn.execute(
@@ -530,9 +571,10 @@ def reset_project(name: str) -> dict:
         conn.close()
         return {"error": f"Project '{name}' not found."}
 
-    # Also clear the log
+    # Also clear the log, notes, and bugs
     conn.execute("DELETE FROM update_log WHERE project = ?", (name,))
     conn.execute("DELETE FROM project_messages WHERE project = ?", (name,))
+    conn.execute("DELETE FROM bugs WHERE project = ?", (name,))
     conn.commit()
     conn.close()
     return {"status": "reset", "project": name}
@@ -599,6 +641,184 @@ def delete_project(name: str) -> dict:
     conn.commit()
     conn.close()
     return {"status": "deleted", "project": name}
+
+
+# ---------------------------------------------------------------------------
+# Export / Import
+# ---------------------------------------------------------------------------
+
+EXPORT_FORMAT_VERSION = 1
+_EXPORT_LOG_CAP = 200
+
+
+def export_project(name: str) -> dict:
+    """Export one project's full state as a plain dict (re-importable)."""
+    conn = get_connection()
+    project = get_project(name, conn)
+    if "error" in project:
+        conn.close()
+        return project
+
+    updates = conn.execute(
+        """SELECT tool_name, summary, timestamp FROM update_log
+           WHERE project = ? ORDER BY timestamp DESC LIMIT ?""",
+        (name, _EXPORT_LOG_CAP),
+    ).fetchall()
+    messages = conn.execute(
+        """SELECT author, message, timestamp FROM project_messages
+           WHERE project = ? ORDER BY timestamp""",
+        (name,),
+    ).fetchall()
+    bugs = conn.execute(
+        "SELECT description, status, created_at, updated_at FROM bugs WHERE project = ? ORDER BY id",
+        (name,),
+    ).fetchall()
+    conn.close()
+
+    project["update_log"] = [
+        {"tool_name": r["tool_name"], "summary": r["summary"], "timestamp": r["timestamp"]}
+        for r in reversed(updates)  # chronological order in the export
+    ]
+    project["messages"] = [
+        {"author": r["author"], "message": r["message"], "timestamp": r["timestamp"]}
+        for r in messages
+    ]
+    project["bugs"] = [
+        {
+            "description": r["description"], "status": r["status"],
+            "created_at": r["created_at"], "updated_at": r["updated_at"],
+        }
+        for r in bugs
+    ]
+    return project
+
+
+def export_all() -> dict:
+    """Export every project into one document."""
+    names = [p["project"] for p in list_projects()]
+    return {
+        "format": "one-context-export",
+        "version": EXPORT_FORMAT_VERSION,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "projects": [export_project(n) for n in names],
+    }
+
+
+def import_project(data: dict, mode: str = "merge") -> dict:
+    """Import one exported project dict.
+
+    merge   - fill empty buckets, keep non-empty ones; union bugs/messages
+              (skip entries that already exist with identical content).
+    replace - overwrite buckets and repo_path; still unions history rows.
+    """
+    if mode not in ("merge", "replace"):
+        return {"error": "mode must be 'merge' or 'replace'."}
+    name = data.get("project")
+    if not name:
+        return {"error": "Export data has no 'project' field."}
+
+    conn = get_connection()
+    ts = datetime.now(timezone.utc).isoformat()
+    row = conn.execute("SELECT name FROM projects WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO projects (name, repo_path, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (name, data.get("repo_path", ""), data.get("created_at", ts), ts),
+        )
+
+    current = get_project(name, conn)
+    buckets = {}
+    for bucket in ("what", "done", "now", "map"):
+        incoming = data.get(bucket, "") or ""
+        if mode == "replace":
+            buckets[bucket] = incoming
+        else:
+            buckets[bucket] = current.get(bucket) or incoming
+
+    repo_path = data.get("repo_path", "") if mode == "replace" else (current.get("repo_path") or data.get("repo_path", ""))
+
+    conn.execute(
+        """UPDATE projects SET what = ?, done = ?, now = ?, map = ?, repo_path = ?, updated_at = ?
+           WHERE name = ?""",
+        (buckets["what"], buckets["done"], buckets["now"],
+         normalize_map_content(buckets["map"]), repo_path, ts, name),
+    )
+
+    imported_updates = 0
+    for u in data.get("update_log", []):
+        exists = conn.execute(
+            "SELECT 1 FROM update_log WHERE project = ? AND timestamp = ? AND summary = ?",
+            (name, u.get("timestamp", ""), u.get("summary", "")),
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                "INSERT INTO update_log (project, tool_name, summary, timestamp) VALUES (?, ?, ?, ?)",
+                (name, u.get("tool_name", "import"), u.get("summary", ""), u.get("timestamp", ts)),
+            )
+            imported_updates += 1
+
+    imported_messages = 0
+    for m in data.get("messages", []):
+        exists = conn.execute(
+            "SELECT 1 FROM project_messages WHERE project = ? AND timestamp = ? AND message = ?",
+            (name, m.get("timestamp", ""), m.get("message", "")),
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                "INSERT INTO project_messages (project, author, message, timestamp) VALUES (?, ?, ?, ?)",
+                (name, m.get("author", "user"), m.get("message", ""), m.get("timestamp", ts)),
+            )
+            imported_messages += 1
+
+    imported_bugs = 0
+    for b in data.get("bugs", []):
+        exists = conn.execute(
+            "SELECT 1 FROM bugs WHERE project = ? AND description = ? AND created_at = ?",
+            (name, b.get("description", ""), b.get("created_at", "")),
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                """INSERT INTO bugs (project, description, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (name, b.get("description", ""),
+                 b.get("status", "open") if b.get("status") in ("open", "fixed") else "open",
+                 b.get("created_at", ts), b.get("updated_at", ts)),
+            )
+            imported_bugs += 1
+
+    conn.commit()
+    result = get_project(name, conn)
+    conn.close()
+    result["imported"] = {
+        "mode": mode,
+        "updates": imported_updates,
+        "messages": imported_messages,
+        "bugs": imported_bugs,
+    }
+    return result
+
+
+def render_project_markdown(data: dict) -> str:
+    """Render an exported project dict as human-readable Markdown."""
+    lines = [f"# {data.get('project', 'unknown')}", ""]
+    if data.get("repo_path"):
+        lines += [f"**Repo:** `{data['repo_path']}`", ""]
+    for bucket, title in (("what", "WHAT"), ("done", "DONE"), ("now", "NOW"), ("map", "MAP")):
+        lines += [f"## {title}", "", data.get(bucket) or "_(empty)_", ""]
+    bugs = data.get("bugs", [])
+    if bugs:
+        lines += ["## BUGS", ""]
+        for b in bugs:
+            mark = "x" if b.get("status") == "fixed" else " "
+            lines.append(f"- [{mark}] {b.get('description', '')}")
+        lines.append("")
+    messages = data.get("messages", [])
+    if messages:
+        lines += ["## NOTES", ""]
+        for m in messages:
+            lines.append(f"- ({m.get('author', 'user')}) {m.get('message', '')}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

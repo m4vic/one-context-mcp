@@ -1,4 +1,7 @@
-# one-context-mcp 0.5.0 — Robustness + Durability Implementation Plan
+# one-context-mcp 0.4.0 — Robustness + Durability Implementation Plan
+
+> Note: this work ships together with the isolation guards as a single
+> **0.4.0** release. 0.4.0 was never published, so there is no separate 0.5.0.
 
 ## Context
 
@@ -9,7 +12,7 @@ one-context-mcp (PyPI `one-ctx`) is at 0.4.0 locally (isolation guards: `ctx_res
 - **Single point of loss** — `~/.ctx/ctx.db` has no export/backup path; users can't commit context to their repo.
 - **Unbounded bucket growth** — only line-count trims (`_trim_to_max_items`, `ctx/llm.py`); one long line defeats it, and `ctx_get` always returns everything.
 
-Scope confirmed with user: **robustness + durability** (tests, CI, security, export/import, size caps). FTS5 and Streamable HTTP deferred. Ships as **0.5.0**.
+Scope confirmed with user: **robustness + durability** (tests, CI, security, export/import, size caps). FTS5 and Streamable HTTP deferred. Ships as **0.4.0**.
 
 ## Step 0 — Commit 0.4.0 baseline
 
@@ -69,7 +72,7 @@ Markdown rendering: single helper `render_project_markdown(data)` shared by tool
 - INSTALLATION_GUIDE.md: same security + backup sections; version pins → 0.5.0; add "bare `python` on multi-Python Windows" troubleshooting entry (found this session).
 - `CLAUDE.md` for the repo: build/test commands (`pytest`, `python -m build`), architecture map, release checklist.
 - `.github/workflows/ci.yml`: matrix {ubuntu-latest, windows-latest} × {3.10, 3.12}; steps: `pip install -e .[dev]` → `pytest` → `python -m build` → `twine check dist/*`.
-- Bump `ctx/__init__.py` + `pyproject.toml` → 0.5.0. Commit (0.4.0 first, then 0.5.0 work), tag `v0.5.0`, build dist. **User runs `twine upload` and `git push` themselves** (established flow).
+- Keep `ctx/__init__.py` + `pyproject.toml` at 0.4.0 (single release; 0.4.0 was never published). Tag `v0.4.0`, build dist. **User runs `twine upload` and `git push` themselves** (established flow).
 
 ## Verification
 

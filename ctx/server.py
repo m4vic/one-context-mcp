@@ -8,6 +8,7 @@ Uses a bare ASGI app with manual path routing so that the MCP SDK's
 SseServerTransport gets direct, unmodified access to scope/receive/send.
 """
 
+import hmac
 import json
 import logging
 import os
@@ -38,6 +39,10 @@ from ctx.database import (
     list_project_history,
     merge_map_content,
     normalize_map_content,
+    export_project,
+    export_all,
+    import_project,
+    render_project_markdown,
 )
 from ctx.llm import merge_context
 from ctx.git import get_git_summary
@@ -65,18 +70,22 @@ def _repo_paths_match(left: str | None, right: str | None) -> bool:
 
 
 def _repo_guard(project: str, stored_repo_path: str, requested_repo_path: str | None, strict: bool = False) -> dict | None:
-    """Return a warning/error when a caller's current folder does not match the linked project."""
-    if strict and not stored_repo_path:
-        return {
-            "error": "Project is not linked to a repo_path.",
-            "project": project,
-            "hint": "Call ctx_link(project, repo_path) once before using strict access.",
-        }
+    """Return a warning/error when a caller's current folder does not match the linked project.
 
+    No requested_repo_path means there is nothing to compare - the call
+    proceeds. (Callers that require a path, like ctx_strict_get, enforce
+    that in their input schema.)
+    """
     if not requested_repo_path:
         return None
 
     if not stored_repo_path:
+        if strict:
+            return {
+                "error": "Project is not linked to a repo_path.",
+                "project": project,
+                "hint": "Call ctx_link(project, repo_path) once before using strict access.",
+            }
         return {
             "warning": "Project is not linked yet; this repo_path can be stored with ctx_link.",
             "project": project,
@@ -147,7 +156,9 @@ async def handle_list_tools() -> list[Tool]:
                 "ALWAYS pass repo_path (the current workspace root) so a "
                 "mismatch with the linked project is detected. If you don't "
                 "know the project name for the current folder, call "
-                "ctx_resolve(repo_path) first instead of guessing."
+                "ctx_resolve(repo_path) first instead of guessing. "
+                "Pass view='brief' when your own context is tight: it returns "
+                "WHAT and NOW in full but only the most recent slice of DONE."
             ),
             inputSchema={
                 "type": "object",
@@ -159,6 +170,11 @@ async def handle_list_tools() -> list[Tool]:
                     "repo_path": {
                         "type": "string",
                         "description": "Optional current workspace root. If it differs from the linked repo_path, a warning is returned.",
+                    },
+                    "view": {
+                        "type": "string",
+                        "enum": ["full", "brief"],
+                        "description": "full (default) or brief (recent DONE slice only; use ctx_history/ctx_search for older entries).",
                     },
                 },
                 "required": ["project"],
@@ -430,6 +446,54 @@ async def handle_list_tools() -> list[Tool]:
                 "required": ["project"],
             },
         ),
+        Tool(
+            name="ctx_export",
+            description=(
+                "Export project context for backup or sharing. Returns JSON "
+                "(canonical, re-importable via ctx_import) or Markdown "
+                "(human-readable). Omit 'project' to export every project. "
+                "Use this to commit context to a repo, move it to another "
+                "machine, or take a backup before risky changes."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project to export. Omit to export all projects.",
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["json", "markdown"],
+                        "description": "Output format, default json. Only json can be re-imported.",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="ctx_import",
+            description=(
+                "Import context previously produced by ctx_export (JSON only). "
+                "mode 'merge' (default) fills empty buckets and unions "
+                "bugs/notes/history without overwriting existing content; "
+                "mode 'replace' overwrites the project's buckets."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "data": {
+                        "type": "string",
+                        "description": "The JSON string produced by ctx_export.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["merge", "replace"],
+                        "description": "merge (default) or replace.",
+                    },
+                },
+                "required": ["data"],
+            },
+        ),
     ]
 
 
@@ -448,6 +512,23 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 result = _with_git_info(result)
                 result["bugs"] = list_bugs(project, status="open")
                 result["bugs_fixed_count"] = count_bugs(project, "fixed")
+
+                if arguments.get("view") == "brief":
+                    done = result.get("done", "")
+                    brief_cap = 2000
+                    if len(done) > brief_cap:
+                        # Keep the newest whole lines (buckets append at the bottom)
+                        lines = done.splitlines()
+                        kept: list[str] = []
+                        size = 0
+                        for line in reversed(lines):
+                            size += len(line) + 1
+                            if size > brief_cap:
+                                break
+                            kept.append(line)
+                        result["done"] = "\n".join(reversed(kept))
+                        result["done_truncated"] = True
+                        result["hint"] = "DONE is truncated in brief view; use ctx_history or ctx_search for older entries."
 
         elif name == "ctx_strict_get":
             project = arguments["project"]
@@ -669,6 +750,47 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                         "bugs": list_bugs(project),
                     }
 
+        elif name == "ctx_export":
+            project = arguments.get("project")
+            fmt = arguments.get("format", "json")
+            if project:
+                data = export_project(project)
+            else:
+                data = export_all()
+
+            if "error" in data:
+                result = data
+            elif fmt == "markdown":
+                if "projects" in data:
+                    text = "\n---\n\n".join(render_project_markdown(p) for p in data["projects"])
+                else:
+                    text = render_project_markdown(data)
+                return [TextContent(type="text", text=text)]
+            else:
+                result = data
+
+        elif name == "ctx_import":
+            raw = arguments["data"]
+            mode = arguments.get("mode", "merge")
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as e:
+                payload = None
+                result = {"error": f"data is not valid JSON: {e}"}
+            if payload is not None:
+                if isinstance(payload, dict) and "projects" in payload:
+                    results = [import_project(p, mode=mode) for p in payload["projects"]]
+                    result = {
+                        "imported_projects": [
+                            r.get("project", r.get("error")) for r in results
+                        ],
+                        "details": results,
+                    }
+                elif isinstance(payload, dict):
+                    result = import_project(payload, mode=mode)
+                else:
+                    result = {"error": "data must be a ctx_export JSON object."}
+
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -686,18 +808,56 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
 sse_transport = SseServerTransport("/messages/")
 
 
-async def _send_json(send, status: int, body: dict):
+def _cors_origin(scope) -> bytes | None:
+    """Decide which CORS origin (if any) to allow for this request.
+
+    Without an auth token the server only binds localhost by default, so the
+    historical wildcard stays. With CTX_AUTH_TOKEN set (network exposure is
+    intended), only localhost origins are reflected - browser pages from other
+    hosts get no CORS grant.
+    """
+    if not os.environ.get("CTX_AUTH_TOKEN"):
+        return b"*"
+    origin = b""
+    for k, v in scope.get("headers", []):
+        if k == b"origin":
+            origin = v
+            break
+    for prefix in (b"http://localhost", b"http://127.0.0.1",
+                   b"https://localhost", b"https://127.0.0.1"):
+        if origin == prefix or origin.startswith(prefix + b":"):
+            return origin
+    return None
+
+
+def _authorized(scope) -> bool:
+    """Check the Bearer token when CTX_AUTH_TOKEN is set (timing-safe)."""
+    token = os.environ.get("CTX_AUTH_TOKEN", "")
+    if not token:
+        return True
+    expected = f"Bearer {token}".encode()
+    supplied = b""
+    for k, v in scope.get("headers", []):
+        if k == b"authorization":
+            supplied = v
+            break
+    return hmac.compare_digest(supplied, expected)
+
+
+async def _send_json(send, status: int, body: dict, cors: bytes | None = b"*"):
     """Helper to send a JSON response via raw ASGI."""
     payload = json.dumps(body).encode()
+    headers = [[b"content-type", b"application/json"]]
+    if cors is not None:
+        headers += [
+            [b"access-control-allow-origin", cors],
+            [b"access-control-allow-methods", b"GET, POST, OPTIONS"],
+            [b"access-control-allow-headers", b"*"],
+        ]
     await send({
         "type": "http.response.start",
         "status": status,
-        "headers": [
-            [b"content-type", b"application/json"],
-            [b"access-control-allow-origin", b"*"],
-            [b"access-control-allow-methods", b"GET, POST, OPTIONS"],
-            [b"access-control-allow-headers", b"*"],
-        ],
+        "headers": headers,
     })
     await send({
         "type": "http.response.body",
@@ -726,20 +886,45 @@ async def app(scope, receive, send):
 
     path = scope.get("path", "")
     method = scope.get("method", "GET")
+    cors = _cors_origin(scope)
+    auth_enabled = bool(os.environ.get("CTX_AUTH_TOKEN"))
 
-    # Handle CORS preflight
+    # Handle CORS preflight (kept open: preflights carry no Authorization)
     if method == "OPTIONS":
+        headers = [[b"access-control-max-age", b"86400"]]
+        if cors is not None:
+            headers += [
+                [b"access-control-allow-origin", cors],
+                [b"access-control-allow-methods", b"GET, POST, OPTIONS"],
+                [b"access-control-allow-headers", b"*"],
+            ]
         await send({
             "type": "http.response.start",
             "status": 204,
-            "headers": [
-                [b"access-control-allow-origin", b"*"],
-                [b"access-control-allow-methods", b"GET, POST, OPTIONS"],
-                [b"access-control-allow-headers", b"*"],
-                [b"access-control-max-age", b"86400"],
-            ],
+            "headers": headers,
         })
         await send({"type": "http.response.body", "body": b""})
+        return
+
+    # Route: GET /health - health check (open, but terse when auth is on)
+    if path == "/health" and method == "GET":
+        body = {"status": "ok", "server": "ctx", "version": __version__}
+        if not auth_enabled:
+            body["tools"] = [
+                "ctx_get", "ctx_strict_get", "ctx_update", "ctx_note",
+                "ctx_history", "ctx_link", "ctx_map", "ctx_search",
+                "ctx_reset", "ctx_list", "ctx_bug", "ctx_resolve",
+                "ctx_export", "ctx_import",
+            ]
+        await _send_json(send, 200, body, cors=cors)
+        return
+
+    # Everything below reads or writes context - require the token if set.
+    if not _authorized(scope):
+        await _send_json(send, 401, {
+            "error": "Unauthorized",
+            "hint": "Send 'Authorization: Bearer <CTX_AUTH_TOKEN>'.",
+        }, cors=cors)
         return
 
     # Route: GET /sse - SSE connection endpoint
@@ -755,19 +940,5 @@ async def app(scope, receive, send):
         await sse_transport.handle_post_message(scope, receive, send)
         return
 
-    # Route: GET /health - health check
-    if path == "/health" and method == "GET":
-        await _send_json(send, 200, {
-            "status": "ok",
-            "server": "ctx",
-            "version": __version__,
-            "tools": [
-                "ctx_get", "ctx_strict_get", "ctx_update", "ctx_note",
-                "ctx_history", "ctx_link", "ctx_map", "ctx_search",
-                "ctx_reset", "ctx_list", "ctx_bug", "ctx_resolve",
-            ],
-        })
-        return
-
     # 404 for everything else
-    await _send_json(send, 404, {"error": "Not found"})
+    await _send_json(send, 404, {"error": "Not found"}, cors=cors)

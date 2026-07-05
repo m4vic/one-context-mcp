@@ -111,7 +111,7 @@ ctx stdio
 Install a specific version:
 
 ```bash
-pip install one-ctx==0.3.0
+pip install one-ctx==0.4.0
 ```
 
 ---
@@ -232,7 +232,7 @@ python -m twine check dist/*
 Most local clients should use stdio. HTTP mode is for advanced or network setups.
 
 ```bash
-ctx serve --host 127.0.0.1 --port 7337
+ctx serve --port 7337
 ```
 
 Then connect MCP clients to:
@@ -240,6 +240,32 @@ Then connect MCP clients to:
 ```text
 http://127.0.0.1:7337/sse
 ```
+
+Since 0.4.0 the server binds localhost only by default. To expose it on a
+network, set an auth token first - the server warns if you skip this:
+
+```bash
+CTX_AUTH_TOKEN=your-secret ctx serve --host 0.0.0.0
+```
+
+Clients must then send an `Authorization: Bearer your-secret` header.
+
+---
+
+## Backup and Restore
+
+All context lives in one SQLite file (`~/.ctx/ctx.db`). Export it to JSON to
+back it up, commit it to a repo, or move to another machine:
+
+```bash
+ctx export myproject -o backup.json     # one project
+ctx export --all -o all-context.json    # everything
+ctx export myproject --format md        # human-readable Markdown
+ctx import backup.json                  # merge (safe, idempotent)
+ctx import backup.json --mode replace   # overwrite buckets
+```
+
+Assistants can do the same through the `ctx_export` and `ctx_import` MCP tools.
 
 ---
 
@@ -293,7 +319,31 @@ Example:
 Use ctx_link for project asrt with repo_path F:\ASRT.
 ```
 
+Since 0.4.0 the server enforces this: a folder linked to one project cannot
+silently create or update a different project, and assistants can call
+`ctx_resolve(repo_path)` to look up the right project name from the folder.
 For stricter reads, ask the assistant to call `ctx_strict_get(project, repo_path)`.
+
+### Stuck "loading" on Windows with multiple Pythons
+
+If your MCP config uses a bare `python` command and you have more than one
+Python installed (python.org, Microsoft Store stub, multiple versions), the
+client may spawn an interpreter that does not have `one-ctx` installed and
+hang silently. Pin the full path in your MCP config:
+
+```json
+{
+  "mcpServers": {
+    "one-context": {
+      "command": "C:\\Program Files\\Python310\\python.exe",
+      "args": ["-m", "ctx.cli", "stdio"],
+      "env": { "PYTHONUNBUFFERED": "1" }
+    }
+  }
+}
+```
+
+The `uvx` setup avoids this problem entirely.
 
 ### `uvx` is not found
 
@@ -322,7 +372,7 @@ pip install -U one-ctx
 Specific version:
 
 ```bash
-pip install one-ctx==0.3.0
+pip install one-ctx==0.4.0
 ```
 
 Install directly from GitHub:
