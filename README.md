@@ -1,5 +1,8 @@
 # one-context-mcp
 
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/one-ctx?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/one-ctx)
+
+
 > One local MCP server that gives Claude, Cline, Codex, and other AI tools the same project memory.
 
 `one-context-mcp` stops the repeated setup explanation every time you switch AI tools. It stores project context locally in a small SQLite database and exposes it through MCP tools that every connected assistant can read and update.
