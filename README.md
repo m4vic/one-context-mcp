@@ -129,6 +129,7 @@ MAP entries are normalized and deduplicated. When a project is linked to a `repo
 | `ctx_note(project, message, author, merge)` | Store a user-authored note for one project |
 | `ctx_history(project, limit)` | Show recent updates and user notes for one project |
 | `ctx_link(project, repo_path)` | Create/link a project to a workspace root for strict file scoping |
+| `ctx_resolve(repo_path)` | Reverse lookup: which project is linked to this folder (works from subfolders too) |
 | `ctx_bug(project, description?, bug_id?, status?)` | Add a bug, mark one fixed, or list a project's bugs |
 | `ctx_search(query)` | Search all projects, update history, user notes, and bugs |
 | `ctx_reset(project)` | Clear one project's context |

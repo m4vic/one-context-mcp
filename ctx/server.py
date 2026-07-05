@@ -20,7 +20,6 @@ from mcp.types import Tool, TextContent
 from ctx import __version__
 from ctx.database import (
     get_project,
-    update_project,
     update_project_map,
     atomic_merge_update,
     reset_project,
@@ -35,6 +34,7 @@ from ctx.database import (
     set_bug_status,
     list_bugs,
     count_bugs,
+    find_project_by_repo_path,
     list_project_history,
     merge_map_content,
     normalize_map_content,
@@ -97,6 +97,31 @@ def _repo_guard(project: str, stored_repo_path: str, requested_repo_path: str | 
     return None
 
 
+def _auto_init_guard(project: str, repo_path: str | None) -> dict | None:
+    """Block creating a new project for a folder already linked to another one.
+
+    Without this, a typo in the project name ('pocket-lab' vs 'pocketlab')
+    silently creates a twin project and forks the context. If the caller's
+    folder is already linked, the write must go to that project or be
+    explicitly re-linked first.
+    """
+    if not repo_path:
+        return None
+    owner = find_project_by_repo_path(repo_path)
+    if owner and owner["project"] != project:
+        return {
+            "error": "This folder already belongs to another project.",
+            "requested_project": project,
+            "linked_project": owner["project"],
+            "repo_path": owner["repo_path"],
+            "hint": (
+                f"Use project '{owner['project']}' for this folder, or call "
+                f"ctx_link('{project}', <other path>) if this is genuinely a new project."
+            ),
+        }
+    return None
+
+
 def _with_git_info(result: dict) -> dict:
     if "error" not in result and result.get("repo_path"):
         git_info = get_git_summary(result["repo_path"])
@@ -118,7 +143,11 @@ async def handle_list_tools() -> list[Tool]:
                 "NOW (current task, current state, what's in progress), "
                 "and MAP (important files and their purpose). "
                 "If the project has a linked git repo, also returns the "
-                "current branch, recent commits, and changed files."
+                "current branch, recent commits, and changed files. "
+                "ALWAYS pass repo_path (the current workspace root) so a "
+                "mismatch with the linked project is detected. If you don't "
+                "know the project name for the current folder, call "
+                "ctx_resolve(repo_path) first instead of guessing."
             ),
             inputSchema={
                 "type": "object",
@@ -163,7 +192,10 @@ async def handle_list_tools() -> list[Tool]:
                 "The server will intelligently merge this into the "
                 "WHAT/DONE/NOW/MAP buckets using smart merging. "
                 "Call this when you finish a task or hit a milestone. "
-                "If repo_path is supplied and does not match an already linked project, the update is rejected."
+                "ALWAYS pass repo_path (the current workspace root): mismatched "
+                "updates are rejected, and creating a new project for a folder "
+                "that is already linked to a different project is rejected "
+                "(prevents typo-split projects and cross-project mixing)."
             ),
             inputSchema={
                 "type": "object",
@@ -344,6 +376,26 @@ async def handle_list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="ctx_resolve",
+            description=(
+                "Find which project is linked to a workspace folder. "
+                "Call this FIRST when you are inside a workspace and do not "
+                "know (or are not sure of) the project name - the folder is "
+                "the source of truth, not a remembered name. Paths inside a "
+                "linked repo resolve to that repo's project."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Absolute path of the current workspace root (or any folder inside it).",
+                    },
+                },
+                "required": ["repo_path"],
+            },
+        ),
+        Tool(
             name="ctx_bug",
             description=(
                 "Track bugs for a project. Three uses based on which fields you send:\n"
@@ -419,6 +471,9 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
             # Get current context (for guard + auto-init decision)
             current = get_project(project)
             if "error" in current:
+                guard = _auto_init_guard(project, repo_path)
+                if guard:
+                    return [TextContent(type="text", text=json.dumps(guard, indent=2))]
                 # Auto-init the project if it doesn't exist
                 logger.info(f"Auto-initializing project '{project}'")
                 init_project(project, repo_path=repo_path or "")
@@ -458,6 +513,9 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
             # Get current map
             current = get_project(project)
             if "error" in current:
+                guard = _auto_init_guard(project, repo_path)
+                if guard:
+                    return [TextContent(type="text", text=json.dumps(guard, indent=2))]
                 # Auto-init
                 init_project(project, repo_path=repo_path or "")
                 current = {"map": ""}
@@ -488,6 +546,9 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
             else:
                 current = get_project(project)
                 if "error" in current:
+                    guard = _auto_init_guard(project, repo_path)
+                    if guard:
+                        return [TextContent(type="text", text=json.dumps(guard, indent=2))]
                     init_project(project, repo_path=repo_path or "")
                     current = {"what": "", "done": "", "now": "", "map": "", "repo_path": repo_path or ""}
                 else:
@@ -564,6 +625,22 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "ctx_list":
             result = list_projects()
+
+        elif name == "ctx_resolve":
+            repo_path = arguments["repo_path"]
+            owner = find_project_by_repo_path(repo_path)
+            if owner:
+                result = {
+                    "project": owner["project"],
+                    "repo_path": owner["repo_path"],
+                    "hint": f"Load context with ctx_get('{owner['project']}').",
+                }
+            else:
+                result = {
+                    "error": "No project is linked to this folder.",
+                    "requested_repo_path": repo_path,
+                    "hint": "Call ctx_link(project, repo_path) to link it, or ctx_list() to see all projects.",
+                }
 
         elif name == "ctx_bug":
             project = arguments["project"]
@@ -687,7 +764,7 @@ async def app(scope, receive, send):
             "tools": [
                 "ctx_get", "ctx_strict_get", "ctx_update", "ctx_note",
                 "ctx_history", "ctx_link", "ctx_map", "ctx_search",
-                "ctx_reset", "ctx_list", "ctx_bug",
+                "ctx_reset", "ctx_list", "ctx_bug", "ctx_resolve",
             ],
         })
         return

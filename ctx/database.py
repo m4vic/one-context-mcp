@@ -542,10 +542,51 @@ def list_projects() -> list[dict]:
     """List all known projects with basic info."""
     conn = get_connection()
     rows = conn.execute(
-        "SELECT name, updated_at FROM projects ORDER BY updated_at DESC"
+        "SELECT name, repo_path, updated_at FROM projects ORDER BY updated_at DESC"
     ).fetchall()
     conn.close()
-    return [{"project": r["name"], "updated_at": r["updated_at"]} for r in rows]
+    return [
+        {"project": r["name"], "repo_path": r["repo_path"], "updated_at": r["updated_at"]}
+        for r in rows
+    ]
+
+
+def _canonical_path(path: str) -> str:
+    """Normalize a filesystem path for comparison without requiring it to exist."""
+    if not path:
+        return ""
+    return os.path.normcase(os.path.abspath(str(Path(path).expanduser())))
+
+
+def find_project_by_repo_path(repo_path: str) -> Optional[dict]:
+    """Find the project linked to a workspace path (or any of its ancestors).
+
+    This is the reverse lookup that makes the folder - not the caller's memory
+    of project names - the source of truth. A path inside a linked repo matches
+    that repo's project, so subdirectories resolve correctly.
+    """
+    candidate = _canonical_path(repo_path)
+    if not candidate:
+        return None
+
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT name, repo_path FROM projects WHERE repo_path != ''"
+    ).fetchall()
+    conn.close()
+
+    best: Optional[dict] = None
+    best_len = -1
+    for r in rows:
+        linked = _canonical_path(r["repo_path"])
+        if not linked:
+            continue
+        if candidate == linked or candidate.startswith(linked + os.sep):
+            # Prefer the deepest (most specific) linked root
+            if len(linked) > best_len:
+                best = {"project": r["name"], "repo_path": r["repo_path"]}
+                best_len = len(linked)
+    return best
 
 
 def delete_project(name: str) -> dict:
