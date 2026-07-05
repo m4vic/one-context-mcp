@@ -111,6 +111,7 @@ You do not edit MCP config when switching work folders. Link each project once w
 | `DONE` | Completed work, decisions, solved issues | JWT auth implemented, UUID user IDs chosen |
 | `NOW` | Current task and next steps | Working on rate limiting middleware |
 | `MAP` | Important files and what they do | `src/auth.py` - auth middleware |
+| `BUGS` | Known bugs, open or fixed | Race condition in concurrent writes - fixed |
 | `NOTES` | User-authored project messages | Remember to keep ASRT context strict |
 
 MAP entries are normalized and deduplicated. When a project is linked to a `repo_path`, file tracking is scoped to that repo so context from different projects does not get mixed.
@@ -128,7 +129,8 @@ MAP entries are normalized and deduplicated. When a project is linked to a `repo
 | `ctx_note(project, message, author, merge)` | Store a user-authored note for one project |
 | `ctx_history(project, limit)` | Show recent updates and user notes for one project |
 | `ctx_link(project, repo_path)` | Create/link a project to a workspace root for strict file scoping |
-| `ctx_search(query)` | Search all projects, update history, and user notes |
+| `ctx_bug(project, description?, bug_id?, status?)` | Add a bug, mark one fixed, or list a project's bugs |
+| `ctx_search(query)` | Search all projects, update history, user notes, and bugs |
 | `ctx_reset(project)` | Clear one project's context |
 | `ctx_list()` | List tracked projects |
 

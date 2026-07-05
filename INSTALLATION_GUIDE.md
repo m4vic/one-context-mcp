@@ -111,7 +111,7 @@ ctx stdio
 Install a specific version:
 
 ```bash
-pip install one-ctx==0.2.1
+pip install one-ctx==0.3.0
 ```
 
 ---
@@ -245,17 +245,18 @@ http://127.0.0.1:7337/sse
 
 ## Merge Modes
 
-Local merge is the default and never calls a model.
+Local merge is the default and never calls a model or an API. This is the recommended setting for normal use.
 
 | Mode | Enable | Uses model/API? |
 |------|--------|-----------------|
 | Local | Default or `CTX_MERGE_MODE=local` | No |
-| Auto | `CTX_MERGE_MODE=auto` | Tries configured providers |
-| Ollama | `CTX_MERGE_MODE=ollama` and `CTX_OLLAMA_MODEL=llama3.2` | Local model |
-| Anthropic | `CTX_MERGE_MODE=anthropic` and `ANTHROPIC_API_KEY=...` | Yes |
-| OpenAI compatible | `CTX_MERGE_MODE=openai` and `OPENAI_API_KEY=...` | Yes |
+| Auto | `CTX_MERGE_MODE=auto` | Tries configured providers, falls back to local |
+| Ollama | `CTX_MERGE_MODE=ollama` | Local model. If `CTX_OLLAMA_MODEL` is unset, the first model you have pulled locally is used automatically. |
+| Anthropic | `CTX_MERGE_MODE=anthropic` and `ANTHROPIC_API_KEY=...` | Yes (cloud) |
+| OpenAI compatible | `CTX_MERGE_MODE=openai` and `OPENAI_API_KEY=...` | Yes (cloud) |
+| Gemini | `CTX_MERGE_MODE=gemini` and `GEMINI_API_KEY=...` | Yes (cloud) |
 
-You do not need any API key for normal use.
+You do not need any API key for normal use. Every mode falls back to local merge automatically if the configured provider is unreachable or misconfigured.
 
 ---
 
@@ -321,7 +322,7 @@ pip install -U one-ctx
 Specific version:
 
 ```bash
-pip install one-ctx==0.2.1
+pip install one-ctx==0.3.0
 ```
 
 Install directly from GitHub:
