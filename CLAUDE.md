@@ -8,12 +8,12 @@ Local MCP server giving Claude/Cline/Codex/etc. shared per-project context via o
 - Build: `python -m build` then `twine check dist/*`
 - Run stdio server: `python -m ctx.cli stdio`
 - Run HTTP server: `python -m ctx.cli serve` (localhost:7337; set `CTX_AUTH_TOKEN` before exposing)
-- CLI: `python -m ctx.cli {status,init,list,search,reset,delete,export,import}`
+- CLI: `python -m ctx.cli {status,init,list,search,reset,delete,export,import,doc}`
 
 ## Architecture
 
-- `ctx/server.py` — MCP tool declarations + handlers (`handle_call_tool`), repo-path guards, bare ASGI app for HTTP/SSE with optional bearer auth
-- `ctx/database.py` — SQLite layer. Tables: projects (WHAT/DONE/NOW/MAP buckets + repo_path), update_log, project_messages, bugs. All read-merge-write goes through `atomic_merge_update` (BEGIN IMMEDIATE — do NOT bypass it, concurrent tools write here). Size caps via `_apply_caps`
+- `ctx/server.py` — MCP tool declarations + handlers (`handle_call_tool`), repo-path guards, bare ASGI app for HTTP/SSE with optional bearer auth. `HOW_TO_CTX` guide + `SERVER_INSTRUCTIONS` (passed to `Server(instructions=...)` so capable clients auto-load a usage pointer)
+- `ctx/database.py` — SQLite layer. Tables: projects (WHAT/DONE/NOW/MAP buckets + repo_path), update_log, project_messages, bugs, project_docs (verbatim per-project docs: plan/instructions/context, keyed by (project,kind)). Buckets go through `atomic_merge_update` (BEGIN IMMEDIATE — do NOT bypass it, concurrent tools write here) + `_apply_caps`; docs are verbatim via `set_doc`/`get_doc` (cap `CTX_MAX_DOC_CHARS`, no merge)
 - `ctx/llm.py` — merge strategies. Default is `_local_merge` (rule-based, zero network). Ollama/Anthropic/OpenAI/Gemini opt-in via `CTX_MERGE_MODE`; all fall back to local
 - `ctx/cli.py` — Click CLI; Windows needs the selector event loop policy at top
 - `ctx/git.py` — subprocess git info, returns None gracefully

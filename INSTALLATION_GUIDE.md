@@ -111,7 +111,7 @@ ctx stdio
 Install a specific version:
 
 ```bash
-pip install one-ctx==0.4.0
+pip install one-ctx==0.5.0
 ```
 
 ---
@@ -148,6 +148,12 @@ Do not change this `cwd` when switching between your own projects. Use `ctx_link
 ---
 
 ## First Use
+
+New to the tool? Send this first — the assistant reads the built-in guide and learns the whole workflow:
+
+```text
+Call how_to_ctx() and follow that guide for this and every session.
+```
 
 Use a stable project name. For example, use `asrt` every time you refer to the ASRT project.
 
@@ -372,7 +378,7 @@ pip install -U one-ctx
 Specific version:
 
 ```bash
-pip install one-ctx==0.4.0
+pip install one-ctx==0.5.0
 ```
 
 Install directly from GitHub:

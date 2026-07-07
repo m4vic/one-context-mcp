@@ -66,3 +66,26 @@ def test_brief_view_small_project_not_truncated(call_tool):
     r = call_tool("ctx_get", {"project": "tiny", "view": "brief"})
     assert "done_truncated" not in r
     assert "one thing" in r["done"]
+
+
+# --- detailed view -------------------------------------------------------------
+
+def test_detailed_view_returns_full_verbatim_history(call_tool):
+    long_detail = "IMPLEMENTATION PLAN. " + "step detail " * 100
+    call_tool("ctx_update", {"project": "det", "session_summary": long_detail, "tool_name": "claude"})
+    call_tool("ctx_note", {"project": "det", "message": "keep anchor_v1 as priority", "author": "u"})
+
+    r = call_tool("ctx_get", {"project": "det", "view": "detailed"})
+    # Buckets still present, plus verbatim history + notes in the same call.
+    assert "updates" in r and "notes" in r
+    assert any(long_detail in u["summary"] for u in r["updates"]), "full detail must survive verbatim"
+    assert any("anchor_v1" in n["message"] for n in r["notes"])
+
+
+def test_detailed_view_is_bounded_by_budget(call_tool, monkeypatch):
+    monkeypatch.setenv("CTX_MAX_DETAIL_CHARS", "2000")
+    for i in range(40):
+        call_tool("ctx_update", {"project": "big", "session_summary": f"update {i} " + "y" * 200, "tool_name": "t"})
+    r = call_tool("ctx_get", {"project": "big", "view": "detailed"})
+    assert r.get("updates_truncated") is True
+    assert "update 39" in r["updates"][0]["summary"]  # newest first, always included

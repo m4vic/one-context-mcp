@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "one-ctx"
-version = "0.4.0"
+version = "0.5.0"
 description = "Local MCP server that shares project context across Claude, Cline, Codex, and other AI tools."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -135,3 +135,30 @@ def test_import_all_document(call_tool):
     call_tool("ctx_reset", {"project": "exp"})
     r = call_tool("ctx_import", {"data": json.dumps(doc), "mode": "replace"})
     assert set(r["imported_projects"]) >= {"exp", "second"}
+
+
+def test_import_accepts_object_not_just_string(call_tool):
+    """The export result can be passed straight back as an object.
+
+    This is what assistants naturally do (ctx_export returns an object), and
+    requiring a hand-stringified JSON was the top import-failure cause.
+    """
+    _populate(call_tool)
+    exported = call_tool("ctx_export", {"project": "exp"})  # a dict
+
+    call_tool("ctx_reset", {"project": "exp"})
+    # Pass the object directly - no json.dumps.
+    r = call_tool("ctx_import", {"data": exported, "mode": "replace"})
+    assert "error" not in r, r
+    assert r["project"] == "exp"
+    assert "src/core.py" in call_tool("ctx_get", {"project": "exp"})["map"]
+
+
+def test_import_all_document_as_object(call_tool):
+    """The all-projects export object also imports without stringifying."""
+    _populate(call_tool)
+    call_tool("ctx_update", {"project": "second", "session_summary": "y", "tool_name": "t"})
+    doc = call_tool("ctx_export", {})  # {format, projects:[...]}
+
+    r = call_tool("ctx_import", {"data": doc, "mode": "replace"})
+    assert set(r["imported_projects"]) >= {"exp", "second"}

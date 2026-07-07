@@ -29,6 +29,12 @@ Add this to Claude Desktop, Cline, Codex, or any MCP client:
 
 Then fully restart the MCP client.
 
+**First prompt** — paste this once and your assistant teaches itself the tool:
+
+```text
+Call how_to_ctx() and follow that guide for this and every session.
+```
+
 Full setup instructions are in [INSTALLATION_GUIDE.md](INSTALLATION_GUIDE.md).
 
 ---
@@ -113,8 +119,9 @@ You do not edit MCP config when switching work folders. Link each project once w
 | `MAP` | Important files and what they do | `src/auth.py` - auth middleware |
 | `BUGS` | Known bugs, open or fixed | Race condition in concurrent writes - fixed |
 | `NOTES` | User-authored project messages | Remember to keep ASRT context strict |
+| `DOCS` | Verbatim per-project documents (plan, instructions, context, ...) | Full implementation plan, kept word-for-word |
 
-MAP entries are normalized and deduplicated. When a project is linked to a `repo_path`, file tracking is scoped to that repo so context from different projects does not get mixed.
+The buckets (`WHAT`/`DONE`/`NOW`/`MAP`) are **auto-merged and summarized** — great for evolving state, but lossy. **`DOCS` are stored and returned verbatim** — use them for anything that must survive exactly (an implementation plan, project rules, a detailed brief). MAP entries are normalized and deduplicated. When a project is linked to a `repo_path`, file tracking is scoped to that repo so context from different projects does not get mixed.
 
 ---
 
@@ -132,12 +139,46 @@ MAP entries are normalized and deduplicated. When a project is linked to a `repo
 | `ctx_resolve(repo_path)` | Reverse lookup: which project is linked to this folder (works from subfolders too) |
 | `ctx_bug(project, description?, bug_id?, status?)` | Add a bug, mark one fixed, or list a project's bugs |
 | `ctx_export(project?, format?)` | Export context as JSON (re-importable) or Markdown; omit project for all |
-| `ctx_import(data, mode?)` | Restore/merge context from a ctx_export JSON |
+| `ctx_import(data, mode?)` | Restore/merge context from a ctx_export result (pass the object directly or a JSON string) |
 | `ctx_search(query)` | Search all projects, update history, user notes, and bugs |
 | `ctx_reset(project)` | Clear one project's context, history, notes, and bugs |
 | `ctx_list()` | List tracked projects with their linked folders |
+| `ctx_doc(project, kind, content?, action?)` | Read/write a **verbatim** doc (plan, instructions, context, ...) — stored exactly, never summarized |
+| `how_to_ctx()` | Return the usage guide so the assistant knows how to use these tools |
 
-`ctx_get` also accepts `view: "brief"` to return only the recent slice of DONE when the calling session is low on context.
+`ctx_get` accepts a `view` argument:
+
+- `view: "brief"` — returns only the recent slice of DONE when the calling session is low on context.
+- `view: "detailed"` — returns the buckets **plus the full verbatim update history, notes, and docs** in the same call. Use this when a tool needs the complete detailed context (for example an implementation plan), not just the compact buckets. Bounded by `CTX_MAX_DETAIL_CHARS` (default 20000).
+
+---
+
+## Per-Project Instructions & Docs
+
+Buckets are auto-summarized. When you need content kept **exactly** — an implementation plan, project rules, a full brief — use `ctx_doc`:
+
+```text
+Save the implementation plan:   ctx_doc(project, "plan", "<full plan text>")
+Set project rules:              ctx_doc(project, "instructions", "Always keep ASRT internals private. Prefer SafetyDiff work.")
+Read it back verbatim:          ctx_doc(project, "plan")
+```
+
+The `instructions` doc is special: `ctx_get` returns it at the top of the snapshot, so every tool that loads context sees the project's rules first.
+
+### Make every AI tool self-instruct from ctx
+
+MCP is pull-based — a server can't push rules into a model. The reliable pattern is to store the rules in ctx (one place, shared across tools) and add **one bootstrap line** to each tool's own rules file, so it always fetches them:
+
+> At the start of work, call `ctx_resolve(<workspace path>)`, then `ctx_get(project)`, and follow the returned `instructions` field as project rules before doing anything else.
+
+Paste that once per tool:
+
+- **Claude Code / Claude Desktop** → your `CLAUDE.md`
+- **Cursor** → `.cursor/rules`
+- **Cline** → Custom Instructions
+- **Codex** → `~/.codex/config`
+
+After that, per-project rules live in ctx via `ctx_doc(project, "instructions", ...)` and propagate to every tool automatically — change them in one place. Clients that support the MCP server-`instructions` capability also receive a short "how to use ctx" pointer at connect time; any assistant can call `how_to_ctx()` for the full guide.
 
 ---
 

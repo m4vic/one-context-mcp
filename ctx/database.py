@@ -183,6 +183,21 @@ def get_connection() -> sqlite3.Connection:
         )
     """)
 
+    # Verbatim, user-authored documents per project (plan, instructions,
+    # context, ...). Unlike the WHAT/DONE/NOW/MAP buckets these are NOT merged
+    # or keyword-routed - they are stored and returned exactly as written.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS project_docs (
+            project     TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            content     TEXT NOT NULL DEFAULT '',
+            updated_at  TEXT NOT NULL,
+            updated_by  TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (project, kind),
+            FOREIGN KEY (project) REFERENCES projects(name) ON DELETE CASCADE
+        )
+    """)
+
     # --- Migration: add columns for existing databases ---
     try:
         conn.execute("SELECT map FROM projects LIMIT 1")
@@ -571,13 +586,112 @@ def reset_project(name: str) -> dict:
         conn.close()
         return {"error": f"Project '{name}' not found."}
 
-    # Also clear the log, notes, and bugs
+    # Also clear the log, notes, bugs, and docs
     conn.execute("DELETE FROM update_log WHERE project = ?", (name,))
     conn.execute("DELETE FROM project_messages WHERE project = ?", (name,))
     conn.execute("DELETE FROM bugs WHERE project = ?", (name,))
+    conn.execute("DELETE FROM project_docs WHERE project = ?", (name,))
     conn.commit()
     conn.close()
     return {"status": "reset", "project": name}
+
+
+# --- Per-project documents (verbatim plan / instructions / context) ----------
+
+def _doc_cap() -> int:
+    """Max chars stored per document. Larger than buckets - docs are intentional."""
+    try:
+        return max(1000, int(os.environ.get("CTX_MAX_DOC_CHARS", "50000")))
+    except ValueError:
+        return 50000
+
+
+def set_doc(project: str, kind: str, content: str, updated_by: str = "") -> dict:
+    """Store a verbatim document for a project. Overwrites the same kind."""
+    kind = (kind or "").strip().lower()
+    if not kind:
+        return {"error": "doc 'kind' is required (e.g. plan, instructions, context)."}
+    conn = get_connection()
+    row = conn.execute("SELECT name FROM projects WHERE name = ?", (project,)).fetchone()
+    if row is None:
+        conn.close()
+        return {"error": f"Project '{project}' not found. Link it first with ctx_link."}
+    content = trim_bucket(content or "", _doc_cap())
+    ts = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """INSERT INTO project_docs (project, kind, content, updated_at, updated_by)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(project, kind) DO UPDATE SET
+             content = excluded.content,
+             updated_at = excluded.updated_at,
+             updated_by = excluded.updated_by""",
+        (project, kind, content, ts, updated_by or ""),
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "saved", "project": project, "kind": kind, "chars": len(content)}
+
+
+def get_doc(project: str, kind: str) -> dict:
+    """Return one verbatim document."""
+    kind = (kind or "").strip().lower()
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT content, updated_at, updated_by FROM project_docs WHERE project = ? AND kind = ?",
+        (project, kind),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return {"error": f"No '{kind}' doc for project '{project}'."}
+    return {
+        "project": project,
+        "kind": kind,
+        "content": row["content"],
+        "updated_at": row["updated_at"],
+        "updated_by": row["updated_by"],
+    }
+
+
+def list_docs(project: str) -> list[dict]:
+    """Return an index (kind + size + timestamp) of a project's docs, no content."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT kind, length(content) AS chars, updated_at, updated_by
+           FROM project_docs WHERE project = ? ORDER BY kind""",
+        (project,),
+    ).fetchall()
+    conn.close()
+    return [
+        {"kind": r["kind"], "chars": r["chars"], "updated_at": r["updated_at"], "updated_by": r["updated_by"]}
+        for r in rows
+    ]
+
+
+def delete_doc(project: str, kind: str) -> dict:
+    """Delete one document."""
+    kind = (kind or "").strip().lower()
+    conn = get_connection()
+    cur = conn.execute(
+        "DELETE FROM project_docs WHERE project = ? AND kind = ?", (project, kind)
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return {"error": f"No '{kind}' doc for project '{project}'."}
+    return {"status": "deleted", "project": project, "kind": kind}
+
+
+def get_docs_map(project: str, conn: Optional[sqlite3.Connection] = None) -> dict:
+    """Return {kind: content} for all of a project's docs (used by export/get)."""
+    should_close = conn is None
+    if conn is None:
+        conn = get_connection()
+    rows = conn.execute(
+        "SELECT kind, content FROM project_docs WHERE project = ?", (project,)
+    ).fetchall()
+    if should_close:
+        conn.close()
+    return {r["kind"]: r["content"] for r in rows}
 
 
 def list_projects() -> list[dict]:
@@ -673,8 +787,16 @@ def export_project(name: str) -> dict:
         "SELECT description, status, created_at, updated_at FROM bugs WHERE project = ? ORDER BY id",
         (name,),
     ).fetchall()
+    docs = conn.execute(
+        "SELECT kind, content, updated_at, updated_by FROM project_docs WHERE project = ? ORDER BY kind",
+        (name,),
+    ).fetchall()
     conn.close()
 
+    project["docs"] = [
+        {"kind": r["kind"], "content": r["content"], "updated_at": r["updated_at"], "updated_by": r["updated_by"]}
+        for r in docs
+    ]
     project["update_log"] = [
         {"tool_name": r["tool_name"], "summary": r["summary"], "timestamp": r["timestamp"]}
         for r in reversed(updates)  # chronological order in the export
@@ -770,6 +892,26 @@ def import_project(data: dict, mode: str = "merge") -> dict:
             )
             imported_messages += 1
 
+    imported_docs = 0
+    for d in data.get("docs", []):
+        kind = (d.get("kind") or "").strip().lower()
+        if not kind:
+            continue
+        existing = conn.execute(
+            "SELECT 1 FROM project_docs WHERE project = ? AND kind = ?", (name, kind)
+        ).fetchone()
+        if mode == "replace" or not existing:
+            conn.execute(
+                """INSERT INTO project_docs (project, kind, content, updated_at, updated_by)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(project, kind) DO UPDATE SET
+                     content = excluded.content,
+                     updated_at = excluded.updated_at,
+                     updated_by = excluded.updated_by""",
+                (name, kind, d.get("content", ""), d.get("updated_at", ts), d.get("updated_by", "")),
+            )
+            imported_docs += 1
+
     imported_bugs = 0
     for b in data.get("bugs", []):
         exists = conn.execute(
@@ -794,6 +936,7 @@ def import_project(data: dict, mode: str = "merge") -> dict:
         "updates": imported_updates,
         "messages": imported_messages,
         "bugs": imported_bugs,
+        "docs": imported_docs,
     }
     return result
 
@@ -805,6 +948,8 @@ def render_project_markdown(data: dict) -> str:
         lines += [f"**Repo:** `{data['repo_path']}`", ""]
     for bucket, title in (("what", "WHAT"), ("done", "DONE"), ("now", "NOW"), ("map", "MAP")):
         lines += [f"## {title}", "", data.get(bucket) or "_(empty)_", ""]
+    for d in data.get("docs", []):
+        lines += [f"## DOC: {d.get('kind', '').upper()}", "", d.get("content") or "_(empty)_", ""]
     bugs = data.get("bugs", [])
     if bugs:
         lines += ["## BUGS", ""]

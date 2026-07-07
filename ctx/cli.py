@@ -195,7 +195,51 @@ def import_cmd(file, mode):
         else:
             stats = result.get("imported", {})
             print(f"[OK] Imported '{result['project']}' ({mode}): "
-                  f"+{stats.get('updates', 0)} updates, +{stats.get('messages', 0)} notes, +{stats.get('bugs', 0)} bugs")
+                  f"+{stats.get('updates', 0)} updates, +{stats.get('messages', 0)} notes, "
+                  f"+{stats.get('bugs', 0)} bugs, +{stats.get('docs', 0)} docs")
+
+
+@cli.command()
+@click.argument("project")
+@click.argument("kind", required=False)
+@click.option("--set", "set_file", type=click.Path(exists=True), help="Read verbatim doc content from this file and save it.")
+@click.option("--content", help="Verbatim doc content to save (alternative to --set).")
+@click.option("--delete", "do_delete", is_flag=True, help="Delete the named doc.")
+def doc(project, kind, set_file, content, do_delete):
+    """Read/write a verbatim project doc (plan, instructions, context, ...).
+
+    ctx doc <project>                 # list docs
+    ctx doc <project> plan            # print the 'plan' doc
+    ctx doc <project> plan --set p.md # save p.md as the 'plan' doc
+    ctx doc <project> plan --delete   # delete the 'plan' doc
+    """
+    from ctx.database import set_doc, get_doc, list_docs, delete_doc
+
+    if not kind:
+        docs = list_docs(project)
+        if not docs:
+            print(f"No docs for '{project}'.")
+            return
+        for d in docs:
+            print(f"- {d['kind']} ({d['chars']} chars, updated {d['updated_at']})")
+        return
+
+    if do_delete:
+        r = delete_doc(project, kind)
+        print(r.get("error") or f"[OK] Deleted '{kind}' doc from '{project}'.")
+        return
+
+    if set_file or content is not None:
+        text = content
+        if set_file:
+            with open(set_file, encoding="utf-8") as f:
+                text = f.read()
+        r = set_doc(project, kind, text or "")
+        print(r.get("error") or f"[OK] Saved '{kind}' doc for '{project}' ({r['chars']} chars).")
+        return
+
+    r = get_doc(project, kind)
+    print(r.get("error") or r["content"])
 
 
 @cli.command()

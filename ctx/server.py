@@ -43,6 +43,10 @@ from ctx.database import (
     export_all,
     import_project,
     render_project_markdown,
+    set_doc,
+    get_doc,
+    list_docs,
+    delete_doc,
 )
 from ctx.llm import merge_context
 from ctx.git import get_git_summary
@@ -53,7 +57,62 @@ logger = logging.getLogger("ctx")
 # MCP Server Setup
 # ---------------------------------------------------------------------------
 
-mcp_server = Server("ctx", version=__version__)
+HOW_TO_CTX = """\
+one-context is shared, persistent project memory across AI tools (Claude, Cline,
+Codex, ...). It stores context locally in SQLite so you don't re-explain a
+project every session. Use it like this:
+
+WORKFLOW (every session)
+1. At the start, find the project for the current folder:
+   call ctx_resolve(repo_path=<workspace root>). If it returns a project, use
+   that exact name. If not, ask the user or call ctx_link(project, repo_path).
+2. Load context: ctx_get(project, repo_path=<workspace root>).
+   - Read the returned `instructions` field FIRST and follow it as project rules.
+   - Use view="detailed" when you need the full verbatim history + docs (e.g. an
+     implementation plan), or view="brief" when your own context is tight.
+3. Do the work.
+4. At the end, persist what changed: ctx_update(project, session_summary=...,
+   tool_name=<your name>). Keep the summary concrete (what changed, what's done,
+   what's next, key files).
+
+WHERE THINGS GO
+- ctx_update  -> WHAT/DONE/NOW/MAP buckets. Auto-merged + summarized. Lossy by
+  design; good for evolving state, NOT for exact text you must preserve.
+- ctx_doc(project, kind, content) -> VERBATIM documents, stored and returned
+  exactly. Use kind="instructions" for project rules the model must follow,
+  kind="plan" for an implementation plan, kind="context" for a full detailed
+  brief. Retrieve with ctx_doc(project, kind) or see them in ctx_get.
+- ctx_note   -> a user message pinned to the project.
+- ctx_bug    -> known bugs (add / list / mark fixed).
+- ctx_map    -> important files and what they do.
+
+RULES OF THUMB
+- Use ONE stable project name per repo; link it once with ctx_link.
+- Never guess the project name from memory - resolve it from the folder.
+- Put anything that must survive verbatim (plans, rules, specs) in ctx_doc, not
+  in a bucket.
+- Back up / move context with ctx_export / ctx_import.
+"""
+
+# Short pointer injected via the MCP server `instructions` capability. Clients
+# that support it show this to the model automatically at connect time; the full
+# guide is always available on demand via the how_to_ctx tool.
+SERVER_INSTRUCTIONS = (
+    "one-context provides shared, persistent per-project memory. At the start of "
+    "work call ctx_resolve(repo_path) then ctx_get(project), and follow the "
+    "returned `instructions` field. Persist changes with ctx_update at the end. "
+    "Call how_to_ctx() for the full usage guide."
+)
+
+mcp_server = Server("ctx", version=__version__, instructions=SERVER_INSTRUCTIONS)
+
+
+def _detail_char_budget() -> int:
+    """Char budget for the verbatim history in ctx_get(view='detailed')."""
+    try:
+        return max(2000, int(os.environ.get("CTX_MAX_DETAIL_CHARS", "20000")))
+    except ValueError:
+        return 20000
 
 
 def _canonical_repo_path(path: str | None) -> str:
@@ -158,7 +217,11 @@ async def handle_list_tools() -> list[Tool]:
                 "know the project name for the current folder, call "
                 "ctx_resolve(repo_path) first instead of guessing. "
                 "Pass view='brief' when your own context is tight: it returns "
-                "WHAT and NOW in full but only the most recent slice of DONE."
+                "WHAT and NOW in full but only the most recent slice of DONE. "
+                "Pass view='detailed' to also get the full verbatim update "
+                "history and notes (nothing summarized) in the same call - use "
+                "this when you need the complete detailed context, e.g. an "
+                "implementation plan, not just the compact buckets."
             ),
             inputSchema={
                 "type": "object",
@@ -173,8 +236,8 @@ async def handle_list_tools() -> list[Tool]:
                     },
                     "view": {
                         "type": "string",
-                        "enum": ["full", "brief"],
-                        "description": "full (default) or brief (recent DONE slice only; use ctx_history/ctx_search for older entries).",
+                        "enum": ["full", "brief", "detailed"],
+                        "description": "full (default), brief (recent DONE slice only), or detailed (adds full verbatim update history + notes for the complete detailed context).",
                     },
                 },
                 "required": ["project"],
@@ -473,7 +536,9 @@ async def handle_list_tools() -> list[Tool]:
         Tool(
             name="ctx_import",
             description=(
-                "Import context previously produced by ctx_export (JSON only). "
+                "Import context previously produced by ctx_export. Pass the "
+                "value ctx_export returned directly (the object), or a JSON "
+                "string of it - both work. "
                 "mode 'merge' (default) fills empty buckets and unions "
                 "bugs/notes/history without overwriting existing content; "
                 "mode 'replace' overwrites the project's buckets."
@@ -482,8 +547,8 @@ async def handle_list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "data": {
-                        "type": "string",
-                        "description": "The JSON string produced by ctx_export.",
+                        "type": ["string", "object"],
+                        "description": "The object returned by ctx_export, or a JSON string of it.",
                     },
                     "mode": {
                         "type": "string",
@@ -493,6 +558,52 @@ async def handle_list_tools() -> list[Tool]:
                 },
                 "required": ["data"],
             },
+        ),
+        Tool(
+            name="ctx_doc",
+            description=(
+                "Read or write a VERBATIM per-project document, stored and "
+                "returned exactly as written (no merging or summarizing, unlike "
+                "the WHAT/DONE/NOW/MAP buckets). Use this for content that must "
+                "survive word-for-word. Common kinds: 'instructions' (project "
+                "rules the assistant must follow - surfaced at the top of "
+                "ctx_get), 'plan' (an implementation plan), 'context' (a full "
+                "detailed brief). Kind is free-form, so 'runbook', "
+                "'architecture', etc. also work. "
+                "Provide 'content' to save; omit it to read. "
+                "action: 'get' (default), 'set', 'list' (index of a project's "
+                "docs), or 'delete'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name."},
+                    "kind": {
+                        "type": "string",
+                        "description": "Document kind, e.g. instructions, plan, context. Required except for action='list'.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Verbatim document text. Providing it implies action='set'.",
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["get", "set", "list", "delete"],
+                        "description": "get (default), set, list, or delete.",
+                    },
+                },
+                "required": ["project"],
+            },
+        ),
+        Tool(
+            name="how_to_ctx",
+            description=(
+                "Return the usage guide for one-context: the recommended "
+                "workflow (resolve -> get -> work -> update), which tool to use "
+                "for what, and best practices. Call this if you are unsure how "
+                "to use these context tools correctly."
+            ),
+            inputSchema={"type": "object", "properties": {}},
         ),
     ]
 
@@ -513,7 +624,20 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 result["bugs"] = list_bugs(project, status="open")
                 result["bugs_fixed_count"] = count_bugs(project, "fixed")
 
-                if arguments.get("view") == "brief":
+                # Surface verbatim docs: project instructions are returned in
+                # full at the top (follow them as rules); other docs (plan,
+                # context, ...) appear as an index unless view='detailed'.
+                docs_index = list_docs(project)
+                view = arguments.get("view")
+                if docs_index:
+                    result["docs"] = docs_index
+                instr = next((d for d in docs_index if d["kind"] == "instructions"), None)
+                if instr:
+                    doc = get_doc(project, "instructions")
+                    if "error" not in doc:
+                        result["instructions"] = doc["content"]
+
+                if view == "brief":
                     done = result.get("done", "")
                     brief_cap = 2000
                     if len(done) > brief_cap:
@@ -529,6 +653,29 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                         result["done"] = "\n".join(reversed(kept))
                         result["done_truncated"] = True
                         result["hint"] = "DONE is truncated in brief view; use ctx_history or ctx_search for older entries."
+                elif view == "detailed":
+                    # One call returns the complete picture: the summarized
+                    # buckets PLUS the full verbatim update history and notes
+                    # (nothing is summarized away). Bounded by a char budget so
+                    # a huge project can't blow up the caller's context.
+                    history = list_project_history(project, limit=100)
+                    budget = _detail_char_budget()
+                    updates, spent = [], 0
+                    for u in history.get("updates", []):  # newest first
+                        spent += len(u.get("summary", "")) + 40
+                        if updates and spent > budget:
+                            break
+                        updates.append(u)
+                    result["updates"] = updates
+                    result["notes"] = history.get("messages", [])
+                    if len(updates) < len(history.get("updates", [])):
+                        result["updates_truncated"] = True
+                        result["hint"] = "Older updates omitted from detailed view; use ctx_history for the full log."
+                    # Full verbatim docs (plan, context, ...) in the same call.
+                    result["docs"] = [
+                        {**d, "content": get_doc(project, d["kind"]).get("content", "")}
+                        for d in docs_index
+                    ]
 
         elif name == "ctx_strict_get":
             project = arguments["project"]
@@ -772,24 +919,68 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "ctx_import":
             raw = arguments["data"]
             mode = arguments.get("mode", "merge")
-            try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError as e:
-                payload = None
-                result = {"error": f"data is not valid JSON: {e}"}
+            # Accept the data as a JSON string OR an already-parsed object/list.
+            # ctx_export returns an object, so assistants naturally pass it
+            # straight back into ctx_import; requiring a hand-stringified JSON
+            # string was the most common cause of import failures.
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", "replace")
+            payload = None
+            if isinstance(raw, (dict, list)):
+                payload = raw
+            elif isinstance(raw, str):
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError as e:
+                    result = {"error": f"data is not valid JSON: {e}"}
+            else:
+                result = {"error": f"data must be a ctx_export JSON object or string (got {type(raw).__name__})."}
+
             if payload is not None:
+                is_collection = (
+                    isinstance(payload, dict) and "projects" in payload
+                ) or isinstance(payload, list)
                 if isinstance(payload, dict) and "projects" in payload:
-                    results = [import_project(p, mode=mode) for p in payload["projects"]]
+                    projects = payload["projects"]
+                elif isinstance(payload, list):
+                    projects = payload
+                else:  # single project dict
+                    projects = [payload]
+
+                if not projects or not all(isinstance(p, dict) for p in projects):
+                    result = {"error": "data must be a ctx_export JSON object (or list of project objects)."}
+                elif is_collection:
+                    results = [import_project(p, mode=mode) for p in projects]
                     result = {
                         "imported_projects": [
                             r.get("project", r.get("error")) for r in results
                         ],
                         "details": results,
                     }
-                elif isinstance(payload, dict):
-                    result = import_project(payload, mode=mode)
                 else:
-                    result = {"error": "data must be a ctx_export JSON object."}
+                    result = import_project(projects[0], mode=mode)
+
+        elif name == "ctx_doc":
+            project = arguments["project"]
+            kind = arguments.get("kind")
+            content = arguments.get("content")
+            action = arguments.get("action")
+            if action is None:
+                action = "set" if content is not None else ("list" if not kind else "get")
+            if action == "list":
+                result = {"project": project, "docs": list_docs(project)}
+            elif action == "set":
+                if content is None:
+                    result = {"error": "content is required to set a doc."}
+                else:
+                    result = set_doc(project, kind or "", content, updated_by=arguments.get("tool_name", ""))
+            elif action == "delete":
+                result = delete_doc(project, kind or "")
+            else:  # get
+                result = get_doc(project, kind or "")
+
+        elif name == "how_to_ctx":
+            return [TextContent(type="text", text=HOW_TO_CTX)]
 
         else:
             result = {"error": f"Unknown tool: {name}"}
