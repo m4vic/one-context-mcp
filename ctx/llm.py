@@ -227,7 +227,7 @@ def _local_merge(
     ]
     summary_lower = session_summary.lower()
     if any(kw in summary_lower for kw in what_keywords):
-        entry = f'- [{tool_name}] {session_summary}'
+        entry = f'- [{tool_name} @ {timestamp}] {session_summary}'
         new_what = (current_what.rstrip() + '\n' + entry).strip() if current_what else entry
         new_what = _deduplicate_lines(new_what)
 

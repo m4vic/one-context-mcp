@@ -8,6 +8,7 @@ Uses a bare ASGI app with manual path routing so that the MCP SDK's
 SseServerTransport gets direct, unmodified access to scope/receive/send.
 """
 
+import asyncio
 import hmac
 import json
 import logging
@@ -190,9 +191,17 @@ def _auto_init_guard(project: str, repo_path: str | None) -> dict | None:
     return None
 
 
-def _with_git_info(result: dict) -> dict:
+async def _with_git_info(result: dict) -> dict:
+    """Attach git status without blocking the event loop.
+
+    git_summary shells out to git (subprocess). Running that synchronously on
+    the asyncio event loop stalls the whole MCP stdio transport for its
+    duration - on Windows this manifested as ctx_get 'hanging' in every client.
+    Offload it to a worker thread so a slow/stuck git can never freeze the
+    protocol loop.
+    """
     if "error" not in result and result.get("repo_path"):
-        git_info = get_git_summary(result["repo_path"])
+        git_info = await asyncio.to_thread(get_git_summary, result["repo_path"])
         if git_info:
             result["git"] = git_info
     return result
@@ -620,7 +629,7 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 guard = _repo_guard(project, result.get("repo_path", ""), arguments.get("repo_path"))
                 if guard:
                     result["safety"] = guard
-                result = _with_git_info(result)
+                result = await _with_git_info(result)
                 result["bugs"] = list_bugs(project, status="open")
                 result["bugs_fixed_count"] = count_bugs(project, "fixed")
 
@@ -686,7 +695,7 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 if guard and "error" in guard:
                     result = guard
                 else:
-                    result = _with_git_info(result)
+                    result = await _with_git_info(result)
                     result["bugs"] = list_bugs(project, status="open")
                     result["bugs_fixed_count"] = count_bugs(project, "fixed")
 

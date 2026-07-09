@@ -5,9 +5,16 @@ All functions return None gracefully if git is unavailable or the path
 is not a git repository. Zero dependencies - uses subprocess only.
 """
 
+import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
+
+# On Windows, spawn git without allocating a console window. A windowless GUI
+# host (Antigravity, Claude Desktop) spawning python -> git.exe can otherwise
+# stall on console allocation.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
 
 def _run_git(repo_path: str, *args: str, timeout: int = 5) -> Optional[str]:
@@ -19,6 +26,11 @@ def _run_git(repo_path: str, *args: str, timeout: int = 5) -> Optional[str]:
             capture_output=True,
             text=True,
             timeout=timeout,
+            # Never inherit the parent's stdin: for an MCP stdio server, stdin
+            # is the JSON-RPC pipe, and a spawned git inheriting it can deadlock
+            # the transport. Detach it explicitly.
+            stdin=subprocess.DEVNULL,
+            creationflags=_NO_WINDOW,
         )
         if result.returncode == 0:
             return result.stdout.strip()
@@ -91,6 +103,9 @@ def get_git_summary(repo_path: str) -> Optional[dict]:
         "changed_files": {...},
     }
     """
+    # Escape hatch: let users turn git inspection off entirely.
+    if os.environ.get("CTX_DISABLE_GIT"):
+        return None
     if not repo_path or not Path(repo_path).exists():
         return None
 
