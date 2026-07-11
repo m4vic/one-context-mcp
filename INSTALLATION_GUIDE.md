@@ -111,7 +111,7 @@ ctx stdio
 Install a specific version:
 
 ```bash
-pip install one-ctx==0.5.0
+pip install one-ctx==0.6.0
 ```
 
 ---
@@ -143,7 +143,7 @@ Local source MCP config:
 
 Replace `C:\\path\\to\\one-context-mcp` with the folder where you cloned this repo.
 
-Do not change this `cwd` when switching between your own projects. Use `ctx_link(project, repo_path)` to link project folders.
+Do not change this `cwd` when switching between your own projects. Pass `repo_path` to `ctx_update` (or run `ctx init <project> --path .`) to link project folders.
 
 ---
 
@@ -175,13 +175,13 @@ To add a direct user note:
 Add a one-context note for project asrt: Keep SafetyDiff as priority after MVP.
 ```
 
-For stricter reads:
+For safe reads, always pass the workspace path — a mismatch is flagged:
 
 ```text
-Use ctx_strict_get for project asrt with repo_path F:\ASRT.
+Load one-context for the current folder F:\ASRT.
 ```
 
-`ctx_strict_get` refuses to return context when the supplied folder does not match the linked project.
+`ctx_get(repo_path=...)` resolves the project from the folder and returns a `safety` warning if the folder does not match the linked project.
 
 ---
 
@@ -191,16 +191,16 @@ You do not edit MCP config when switching work folders.
 
 - MCP config starts the server.
 - `project` chooses the context namespace.
-- `ctx_link(project, repo_path)` binds a namespace to a folder.
+- A project is bound to a folder the first time you pass `repo_path` to `ctx_update` (or via `ctx init <project> --path .`).
 
-Example:
+Example (each links itself on first update):
 
 ```text
-ctx_link(asrt, F:\ASRT)
-ctx_link(other-project, F:\other-project)
+ctx_update(asrt, repo_path=F:\ASRT, ...)
+ctx_update(other-project, repo_path=F:\other-project, ...)
 ```
 
-Then any client can load either project:
+Then any client can load either project — by name or by folder:
 
 ```text
 ctx_get(asrt)
@@ -271,7 +271,7 @@ ctx import backup.json                  # merge (safe, idempotent)
 ctx import backup.json --mode replace   # overwrite buckets
 ```
 
-Assistants can do the same through the `ctx_export` and `ctx_import` MCP tools.
+Backup/restore is a CLI operation (since 0.6.0 it is not part of the MCP tool surface).
 
 ---
 
@@ -317,18 +317,19 @@ Then restart the MCP client. MCP clients often cache tool lists until a fresh se
 
 ### Project context is mixed
 
-Use `ctx_link(project, repo_path)` once per project and keep the same project name in every tool.
+Always pass `repo_path` (the workspace root) so each project stays bound to its
+folder, and keep the same project name in every tool.
 
 Example:
 
 ```text
-Use ctx_link for project asrt with repo_path F:\ASRT.
+Update one-context for project asrt with repo_path F:\ASRT.
 ```
 
-Since 0.4.0 the server enforces this: a folder linked to one project cannot
-silently create or update a different project, and assistants can call
-`ctx_resolve(repo_path)` to look up the right project name from the folder.
-For stricter reads, ask the assistant to call `ctx_strict_get(project, repo_path)`.
+The server enforces this: a folder linked to one project cannot silently create
+or update a different project. Assistants resolve the right project by calling
+`ctx_get(repo_path=...)` (which returns a `safety` warning on a folder mismatch)
+instead of guessing the name.
 
 ### Stuck "loading" on Windows with multiple Pythons
 
@@ -378,7 +379,7 @@ pip install -U one-ctx
 Specific version:
 
 ```bash
-pip install one-ctx==0.5.0
+pip install one-ctx==0.6.0
 ```
 
 Install directly from GitHub:

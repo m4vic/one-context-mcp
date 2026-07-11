@@ -108,7 +108,7 @@ At the end of a work session:
 Update one-context for project asrt with what we changed, what is done, what is next, and important files.
 ```
 
-You do not edit MCP config when switching work folders. Link each project once with `ctx_link(project, repo_path)`.
+You do not edit MCP config when switching work folders. Each project links itself the first time you pass `repo_path` to `ctx_update` (or run `ctx init <project> --path .`).
 
 ---
 
@@ -120,8 +120,7 @@ You do not edit MCP config when switching work folders. Link each project once w
 | `DONE` | Completed work, decisions, solved issues | JWT auth implemented, UUID user IDs chosen |
 | `NOW` | Current task and next steps | Working on rate limiting middleware |
 | `MAP` | Important files and what they do | `src/auth.py` - auth middleware |
-| `BUGS` | Known bugs, open or fixed | Race condition in concurrent writes - fixed |
-| `NOTES` | User-authored project messages | Remember to keep ASRT context strict |
+| `NOTES` | User-authored messages (`ctx_update` with `author=`) | Remember to keep ASRT context strict |
 | `DOCS` | Verbatim per-project documents (plan, instructions, context, ...) | Full implementation plan, kept word-for-word |
 
 The buckets (`WHAT`/`DONE`/`NOW`/`MAP`) are **auto-merged and summarized** — great for evolving state, but lossy. **`DOCS` are stored and returned verbatim** — use them for anything that must survive exactly (an implementation plan, project rules, a detailed brief). MAP entries are normalized and deduplicated. When a project is linked to a `repo_path`, file tracking is scoped to that repo so context from different projects does not get mixed.
@@ -130,29 +129,30 @@ The buckets (`WHAT`/`DONE`/`NOW`/`MAP`) are **auto-merged and summarized** — g
 
 ## MCP Tools
 
+**5 focused tools** (since 0.6.0). The job is a smooth, correct context handoff between tools — not a big tool surface.
+
 | Tool | Purpose |
 |------|---------|
-| `ctx_get(project)` | Load WHAT, DONE, NOW, MAP, repo path, and git info |
-| `ctx_strict_get(project, repo_path)` | Load context only when the current workspace path matches the linked project |
-| `ctx_update(project, session_summary, tool_name)` | Merge a session summary into project context |
-| `ctx_map(project, files, replace)` | Register important files manually |
-| `ctx_note(project, message, author, merge)` | Store a user-authored note for one project |
-| `ctx_history(project, limit)` | Show recent updates and user notes for one project |
-| `ctx_link(project, repo_path)` | Create/link a project to a workspace root for strict file scoping |
-| `ctx_resolve(repo_path)` | Reverse lookup: which project is linked to this folder (works from subfolders too) |
-| `ctx_bug(project, description?, bug_id?, status?)` | Add a bug, mark one fixed, or list a project's bugs |
-| `ctx_export(project?, format?)` | Export context as JSON (re-importable) or Markdown; omit project for all |
-| `ctx_import(data, mode?)` | Restore/merge context from a ctx_export result (pass the object directly or a JSON string) |
-| `ctx_search(query)` | Search all projects, update history, user notes, and bugs |
-| `ctx_reset(project)` | Clear one project's context, history, notes, and bugs |
-| `ctx_list()` | List tracked projects with their linked folders |
-| `ctx_doc(project, kind, content?, action?)` | Read/write a **verbatim** doc (plan, instructions, context, ...) — stored exactly, never summarized |
-| `how_to_ctx()` | Return the usage guide so the assistant knows how to use these tools |
+| `ctx_get(project?, repo_path?, view?)` | Load a project's context (+ git). Omit `project` to auto-resolve it from `repo_path`. `view`: `full` (default), `brief` (recent DONE only), `detailed` (full verbatim history + notes + docs). A mismatched `repo_path` returns a safety warning. |
+| `ctx_update(project?, session_summary?, tool_name, repo_path?, author?, files?)` | Persist state (merged into WHAT/DONE/NOW/MAP). `repo_path` also links the project. `author` records a verbatim user note. `files` registers important files. Empty summary + `repo_path` just links/creates the project. |
+| `ctx_doc(project, kind, content?, action?)` | Read/write a **verbatim** doc (`plan`, `instructions`, `context`, `handoff`, …) — stored exactly, never summarized. |
+| `ctx_search(query, project?)` | Search context, history, notes, and bugs; optional `project` scope. |
+| `how_to_ctx()` | Return the usage guide so any assistant learns the workflow. |
 
-`ctx_get` accepts a `view` argument:
+### Migrating from ≤0.5.x
 
-- `view: "brief"` — returns only the recent slice of DONE when the calling session is low on context.
-- `view: "detailed"` — returns the buckets **plus the full verbatim update history, notes, and docs** in the same call. Use this when a tool needs the complete detailed context (for example an implementation plan), not just the compact buckets. Bounded by `CTX_MAX_DETAIL_CHARS` (default 20000).
+The tool surface was slimmed from 16 to 5. Every capability is preserved — folded into a parameter or moved to the CLI:
+
+| Old tool | Now |
+|----------|-----|
+| `ctx_resolve(path)` | `ctx_get(repo_path=path)` |
+| `ctx_strict_get(p, path)` | `ctx_get(p, repo_path=path)` — heed the `safety` warning |
+| `ctx_link(p, path)` | `ctx_update(p, repo_path=path)` |
+| `ctx_note(p, msg, author)` | `ctx_update(p, session_summary=msg, author=author)` |
+| `ctx_map(p, files)` | `ctx_update(p, files=[...])` |
+| `ctx_history(p)` | `ctx_get(p, view="detailed")` |
+| `ctx_bug(...)` | a note, or `ctx_doc(p, "bugs", ...)` |
+| `ctx_export` / `ctx_import` / `ctx_reset` / `ctx_list` | CLI: `ctx export` / `import` / `reset` / `list` |
 
 ---
 
@@ -172,7 +172,7 @@ The `instructions` doc is special: `ctx_get` returns it at the top of the snapsh
 
 MCP is pull-based — a server can't push rules into a model. The reliable pattern is to store the rules in ctx (one place, shared across tools) and add **one bootstrap line** to each tool's own rules file, so it always fetches them:
 
-> At the start of work, call `ctx_resolve(<workspace path>)`, then `ctx_get(project)`, and follow the returned `instructions` field as project rules before doing anything else.
+> At the start of work, call `ctx_get(repo_path=<workspace path>)` (omit the project — the folder resolves it), and follow the returned `instructions` field as project rules before doing anything else.
 
 Paste that once per tool:
 
@@ -213,7 +213,7 @@ ctx import context-backup.json                # merge into existing (safe, idemp
 ctx import context-backup.json --mode replace # overwrite buckets
 ```
 
-Any MCP client can do the same via the `ctx_export` / `ctx_import` tools.
+Backup and restore are CLI-only since 0.6.0 — the MCP tool surface stays minimal.
 
 ---
 

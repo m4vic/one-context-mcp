@@ -39,14 +39,35 @@ def _run_git(repo_path: str, *args: str, timeout: int = 5) -> Optional[str]:
         return None
 
 
-def is_git_repo(repo_path: str) -> bool:
-    """Check if the given path is inside a git repository."""
-    return _run_git(repo_path, "rev-parse", "--git-dir") is not None
+def _parse_status(output: str) -> tuple[str, dict]:
+    """Parse `git status --porcelain=v1 --branch` output.
 
-
-def get_branch(repo_path: str) -> Optional[str]:
-    """Get the current branch name (e.g. 'main', 'feature-auth')."""
-    return _run_git(repo_path, "rev-parse", "--abbrev-ref", "HEAD")
+    Returns (branch, {"staged": [...], "unstaged": [...], "untracked": [...]}).
+    """
+    branch = "unknown"
+    staged, unstaged, untracked = [], [], []
+    for line in output.splitlines():
+        if line.startswith("## "):
+            head = line[3:]
+            # "## No commits yet on main" | "## HEAD (no branch)" | "## main...origin/main [ahead 1]"
+            if head.startswith("No commits yet on "):
+                branch = head[len("No commits yet on "):].strip()
+            elif head.startswith("HEAD "):
+                branch = "HEAD"
+            else:
+                branch = head.split("...", 1)[0].split(" ", 1)[0].strip() or "unknown"
+            continue
+        if len(line) < 3:
+            continue
+        x, y, path = line[0], line[1], line[3:]
+        if x == "?" and y == "?":
+            untracked.append(path)
+            continue
+        if x not in (" ", "?"):
+            staged.append(path)
+        if y not in (" ", "?"):
+            unstaged.append(path)
+    return branch, {"staged": staged, "unstaged": unstaged, "untracked": untracked}
 
 
 def get_recent_commits(repo_path: str, n: int = 5) -> Optional[list[dict]]:
@@ -74,33 +95,14 @@ def get_recent_commits(repo_path: str, n: int = 5) -> Optional[list[dict]]:
     return commits
 
 
-def get_changed_files(repo_path: str) -> Optional[dict]:
-    """Get uncommitted changes (staged + unstaged + untracked).
-
-    Returns: {"staged": [...], "unstaged": [...], "untracked": [...]}
-    """
-    staged = _run_git(repo_path, "diff", "--cached", "--name-only")
-    unstaged = _run_git(repo_path, "diff", "--name-only")
-    untracked = _run_git(repo_path, "ls-files", "--others", "--exclude-standard")
-
-    if staged is None and unstaged is None and untracked is None:
-        return None
-
-    return {
-        "staged": [f for f in (staged or "").splitlines() if f],
-        "unstaged": [f for f in (unstaged or "").splitlines() if f],
-        "untracked": [f for f in (untracked or "").splitlines() if f],
-    }
-
-
 def get_git_summary(repo_path: str) -> Optional[dict]:
-    """Get a complete git status summary for a repo.
+    """Get a complete git status summary for a repo, in just 2 subprocess calls.
 
-    Returns None if the path is not a git repo.
+    Returns None if the path is not a git repo (or git is unavailable).
     Otherwise returns: {
         "branch": "main",
         "recent_commits": [...],
-        "changed_files": {...},
+        "changed_files": {"staged": [...], "unstaged": [...], "untracked": [...]},
     }
     """
     # Escape hatch: let users turn git inspection off entirely.
@@ -109,13 +111,15 @@ def get_git_summary(repo_path: str) -> Optional[dict]:
     if not repo_path or not Path(repo_path).exists():
         return None
 
-    if not is_git_repo(repo_path):
+    # One call gives branch + all changes AND doubles as the "is this a repo?"
+    # check (returns None on non-zero exit, e.g. not a git repo).
+    status = _run_git(repo_path, "status", "--porcelain=v1", "--branch")
+    if status is None:
         return None
 
+    branch, changed_files = _parse_status(status)
     return {
-        "branch": get_branch(repo_path) or "unknown",
+        "branch": branch,
         "recent_commits": get_recent_commits(repo_path, n=5) or [],
-        "changed_files": get_changed_files(repo_path) or {
-            "staged": [], "unstaged": [], "untracked": []
-        },
+        "changed_files": changed_files,
     }

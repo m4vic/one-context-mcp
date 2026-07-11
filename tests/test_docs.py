@@ -3,6 +3,7 @@
 import asyncio
 
 from ctx.server import handle_call_tool
+from ctx.database import reset_project
 
 
 def _link(call_tool, project="doc"):
@@ -92,24 +93,11 @@ def test_plan_indexed_but_full_only_in_detailed(call_tool):
 
 # --- durability ----------------------------------------------------------------
 
-def test_docs_survive_export_import_roundtrip(call_tool):
-    _link(call_tool)
-    call_tool("ctx_doc", {"project": "doc", "kind": "instructions", "content": "rule A"})
-    call_tool("ctx_doc", {"project": "doc", "kind": "plan", "content": "step 1"})
-
-    exported = call_tool("ctx_export", {"project": "doc"})
-    call_tool("ctx_reset", {"project": "doc"})
-    assert "error" in call_tool("ctx_doc", {"project": "doc", "kind": "plan"})  # reset cleared docs
-
-    call_tool("ctx_import", {"data": exported, "mode": "replace"})
-    assert call_tool("ctx_doc", {"project": "doc", "kind": "instructions"})["content"] == "rule A"
-    assert call_tool("ctx_doc", {"project": "doc", "kind": "plan"})["content"] == "step 1"
-
-
 def test_reset_clears_docs(call_tool):
+    # export/import roundtrip of docs is covered in test_export_import.py.
     _link(call_tool)
     call_tool("ctx_doc", {"project": "doc", "kind": "plan", "content": "p"})
-    call_tool("ctx_reset", {"project": "doc"})
+    reset_project("doc")
     assert call_tool("ctx_doc", {"project": "doc", "action": "list"})["docs"] == []
 
 
@@ -118,5 +106,5 @@ def test_reset_clears_docs(call_tool):
 def test_how_to_ctx_returns_guide():
     result = asyncio.run(handle_call_tool("how_to_ctx", {}))
     text = result[0].text
-    assert "ctx_resolve" in text and "ctx_update" in text and "ctx_doc" in text
+    assert "ctx_get" in text and "ctx_update" in text and "ctx_doc" in text
     assert len(text) > 200

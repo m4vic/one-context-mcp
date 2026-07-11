@@ -211,8 +211,11 @@ def _local_merge(
 
     Strategy:
     - WHAT: Update only if summary contains project-level keywords.
-    - DONE: Move current NOW to DONE, then add new summary entry.
-    - NOW: Extract "in progress" / "next" signals from summary.
+    - DONE: Move current NOW to DONE when it is replaced, then add the new
+      summary entry.
+    - NOW: Extract "in progress" / "next" signals from summary; if the
+      summary carries no such signal, keep the current NOW instead of
+      blanking the next tool's view of what's in progress.
     - MAP: Extract file paths mentioned in the summary.
     """
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')
@@ -231,15 +234,6 @@ def _local_merge(
         new_what = (current_what.rstrip() + '\n' + entry).strip() if current_what else entry
         new_what = _deduplicate_lines(new_what)
 
-    # --- DONE ---
-    new_done = current_done
-    if current_now.strip():
-        new_done = (new_done.rstrip() + '\n' + current_now.strip()).strip() if new_done.strip() else current_now.strip()
-    entry = f'- [{tool_name} @ {timestamp}] {session_summary}'
-    new_done = (new_done.rstrip() + '\n' + entry).strip() if new_done.strip() else entry
-    new_done = _deduplicate_lines(new_done)
-    new_done = _trim_to_max_items(new_done, max_items=50)
-
     # --- NOW ---
     now_keywords = [
         'currently', 'in progress', 'working on', 'next step',
@@ -251,6 +245,21 @@ def _local_merge(
         sentence = sentence.strip()
         if sentence and any(kw in sentence.lower() for kw in now_keywords):
             new_now += f'- {sentence}\n'
+    new_now = new_now.strip()
+
+    # --- DONE ---
+    new_done = current_done
+    if new_now and current_now.strip():
+        # NOW is being replaced: the previous current task becomes history.
+        new_done = (new_done.rstrip() + '\n' + current_now.strip()).strip() if new_done.strip() else current_now.strip()
+    entry = f'- [{tool_name} @ {timestamp}] {session_summary}'
+    new_done = (new_done.rstrip() + '\n' + entry).strip() if new_done.strip() else entry
+    new_done = _deduplicate_lines(new_done)
+    new_done = _trim_to_max_items(new_done, max_items=50)
+
+    if not new_now:
+        # No current-task signal in this summary: keep the existing NOW.
+        new_now = current_now.strip()
 
     # --- MAP ---
     new_map = current_map

@@ -382,7 +382,7 @@ def atomic_merge_update(
 
 
 def update_project_map(name: str, map_content: str) -> dict:
-    """Update only the MAP bucket for a project (for ctx_map tool)."""
+    """Replace the MAP bucket for a project (normalized + capped)."""
     conn = get_connection()
     map_content = normalize_map_content(map_content)
     map_content = trim_bucket(map_content, _bucket_cap("CTX_MAX_MAP_CHARS", 4000))
@@ -398,6 +398,41 @@ def update_project_map(name: str, map_content: str) -> dict:
         return {"error": f"Project '{name}' not found."}
 
     conn.commit()
+    result = get_project(name, conn)
+    conn.close()
+    return result
+
+
+def merge_project_map(name: str, new_entries: str) -> dict:
+    """Atomically merge entries into a project's MAP bucket.
+
+    The read-merge-write runs inside a single BEGIN IMMEDIATE transaction
+    (like atomic_merge_update) so two tools registering files concurrently
+    cannot lose each other's entries.
+    """
+    conn = get_connection()
+    conn.isolation_level = None  # manual transaction control
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT map FROM projects WHERE name = ?", (name,)
+        ).fetchone()
+        if row is None:
+            conn.execute("ROLLBACK")
+            conn.close()
+            return {"error": f"Project '{name}' not found."}
+        merged = merge_map_content(row["map"], new_entries)
+        merged = trim_bucket(merged, _bucket_cap("CTX_MAX_MAP_CHARS", 4000))
+        ts = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE projects SET map = ?, updated_at = ? WHERE name = ?",
+            (merged, ts, name),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        conn.close()
+        raise
     result = get_project(name, conn)
     conn.close()
     return result
@@ -615,7 +650,7 @@ def set_doc(project: str, kind: str, content: str, updated_by: str = "") -> dict
     row = conn.execute("SELECT name FROM projects WHERE name = ?", (project,)).fetchone()
     if row is None:
         conn.close()
-        return {"error": f"Project '{project}' not found. Link it first with ctx_link."}
+        return {"error": f"Project '{project}' not found. Create it first with ctx_update(project=..., repo_path=...)."}
     content = trim_bucket(content or "", _doc_cap())
     ts = datetime.now(timezone.utc).isoformat()
     conn.execute(
@@ -970,16 +1005,22 @@ def render_project_markdown(data: dict) -> str:
 # Cross-project search
 # ---------------------------------------------------------------------------
 
-def search_projects(query: str) -> list[dict]:
-    """Search across all projects' context buckets (what/done/now/map)."""
+def search_projects(query: str, project: Optional[str] = None) -> list[dict]:
+    """Search across projects' context buckets (what/done/now/map).
+
+    `project` limits the search to one project; scoping happens in SQL so a
+    scoped search can never lose matches to a global LIMIT.
+    """
     conn = get_connection()
     pattern = f"%{query}%"
-    rows = conn.execute(
-        """SELECT name, what, done, now, map, updated_at FROM projects
-           WHERE what LIKE ? OR done LIKE ? OR now LIKE ? OR map LIKE ?
-           ORDER BY updated_at DESC""",
-        (pattern, pattern, pattern, pattern),
-    ).fetchall()
+    sql = """SELECT name, what, done, now, map, updated_at FROM projects
+             WHERE (what LIKE ? OR done LIKE ? OR now LIKE ? OR map LIKE ?)"""
+    params: list = [pattern, pattern, pattern, pattern]
+    if project:
+        sql += " AND name = ?"
+        params.append(project)
+    sql += " ORDER BY updated_at DESC"
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
 
     results = []
@@ -1005,17 +1046,18 @@ def search_projects(query: str) -> list[dict]:
     return results
 
 
-def search_logs(query: str) -> list[dict]:
-    """Search across all projects' update history."""
+def search_logs(query: str, project: Optional[str] = None) -> list[dict]:
+    """Search update history, optionally scoped to one project (in SQL)."""
     conn = get_connection()
     pattern = f"%{query}%"
-    rows = conn.execute(
-        """SELECT project, tool_name, summary, timestamp FROM update_log
-           WHERE summary LIKE ?
-           ORDER BY timestamp DESC
-           LIMIT 20""",
-        (pattern,),
-    ).fetchall()
+    sql = """SELECT project, tool_name, summary, timestamp FROM update_log
+             WHERE summary LIKE ?"""
+    params: list = [pattern]
+    if project:
+        sql += " AND project = ?"
+        params.append(project)
+    sql += " ORDER BY timestamp DESC LIMIT 20"
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
 
     return [
@@ -1029,17 +1071,18 @@ def search_logs(query: str) -> list[dict]:
     ]
 
 
-def search_messages(query: str) -> list[dict]:
-    """Search user-authored project messages."""
+def search_messages(query: str, project: Optional[str] = None) -> list[dict]:
+    """Search user-authored notes, optionally scoped to one project (in SQL)."""
     conn = get_connection()
     pattern = f"%{query}%"
-    rows = conn.execute(
-        """SELECT project, id, author, message, timestamp FROM project_messages
-           WHERE message LIKE ?
-           ORDER BY timestamp DESC
-           LIMIT 20""",
-        (pattern,),
-    ).fetchall()
+    sql = """SELECT project, id, author, message, timestamp FROM project_messages
+             WHERE message LIKE ?"""
+    params: list = [pattern]
+    if project:
+        sql += " AND project = ?"
+        params.append(project)
+    sql += " ORDER BY timestamp DESC LIMIT 20"
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
 
     return [
@@ -1054,16 +1097,16 @@ def search_messages(query: str) -> list[dict]:
     ]
 
 
-def search_bugs(query: str) -> list[dict]:
-    """Search bug descriptions across all projects."""
+def search_bugs(query: str, project: Optional[str] = None) -> list[dict]:
+    """Search bug descriptions, optionally scoped to one project (in SQL)."""
     conn = get_connection()
     pattern = f"%{query}%"
-    rows = conn.execute(
-        """SELECT * FROM bugs
-           WHERE description LIKE ?
-           ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, updated_at DESC
-           LIMIT 20""",
-        (pattern,),
-    ).fetchall()
+    sql = "SELECT * FROM bugs WHERE description LIKE ?"
+    params: list = [pattern]
+    if project:
+        sql += " AND project = ?"
+        params.append(project)
+    sql += " ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, updated_at DESC LIMIT 20"
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
     return [_bug_row_to_dict(r) for r in rows]

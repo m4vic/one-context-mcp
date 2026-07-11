@@ -1,28 +1,45 @@
-"""Happy-path coverage for every MCP tool, exercised in-process."""
+"""Happy-path coverage for the 5 MCP tools + the behaviors folded into them.
+
+Capabilities that moved to the CLI/DB layer in 0.6.0 (reset, list, bugs,
+export/import) are covered directly against ctx.database here and in
+test_export_import.py.
+"""
 
 import os
+
+from ctx.database import reset_project, list_projects, add_bug, set_bug_status, list_bugs
 
 REPO_A = os.path.join(os.sep, "work", "projA") if os.name != "nt" else r"C:\work\projA"
 REPO_B = os.path.join(os.sep, "work", "projB") if os.name != "nt" else r"C:\work\projB"
 
 
-def test_link_creates_and_relinks(call_tool):
-    r = call_tool("ctx_link", {"project": "alpha", "repo_path": REPO_A})
+# --- ctx_update: link / merge / note / map folds -----------------------------
+
+def test_update_links_project(call_tool):
+    # Empty summary + repo_path just links/creates the project (folds ctx_link).
+    r = call_tool("ctx_update", {"project": "alpha", "repo_path": REPO_A, "tool_name": "t"})
     assert r["project"] == "alpha"
     assert r["repo_path"] == REPO_A
-
-    # Linking again with a new path updates it
-    r = call_tool("ctx_link", {"project": "alpha", "repo_path": REPO_B})
-    assert r["repo_path"] == REPO_B
+    assert r.get("status") == "linked"
 
 
-def test_get_unknown_project_errors(call_tool):
-    r = call_tool("ctx_get", {"project": "ghost"})
+def test_update_links_existing_unlinked_project(call_tool):
+    # A project created without a repo_path (e.g. by a summary-only update)
+    # must still be linkable later via ctx_update (folds ctx_link).
+    call_tool("ctx_update", {"project": "late-link", "session_summary": "hello", "tool_name": "t"})
+    r = call_tool("ctx_update", {"project": "late-link", "repo_path": REPO_A, "tool_name": "t"})
+    assert "error" not in r
+    assert r["repo_path"] == REPO_A
+
+    # ...but it must not claim a folder owned by another project.
+    call_tool("ctx_update", {"project": "thief", "session_summary": "hi", "tool_name": "t"})
+    r = call_tool("ctx_update", {"project": "thief", "repo_path": REPO_A, "tool_name": "t"})
     assert "error" in r
+    assert r["linked_project"] == "late-link"
 
 
 def test_update_merges_and_extracts_map(call_tool):
-    call_tool("ctx_link", {"project": "alpha", "repo_path": REPO_A})
+    call_tool("ctx_update", {"project": "alpha", "repo_path": REPO_A, "tool_name": "t"})
     r = call_tool("ctx_update", {
         "project": "alpha",
         "session_summary": "Stack: Python + FastAPI. Built endpoints in src/api.py. Currently working on auth in src/auth.py.",
@@ -39,86 +56,90 @@ def test_update_merges_and_extracts_map(call_tool):
 
 def test_update_auto_inits_unknown_project(call_tool):
     r = call_tool("ctx_update", {
-        "project": "brand-new",
-        "session_summary": "hello world",
-        "tool_name": "t",
+        "project": "brand-new", "session_summary": "hello world", "tool_name": "t",
     })
     assert "error" not in r
     assert r["project"] == "brand-new"
 
 
 def test_unlinked_project_supports_repeated_updates(call_tool):
-    """Regression: strict guard used to reject the 2nd update of any
-    project that had no linked repo_path, even with no repo_path passed."""
     for i in range(3):
         r = call_tool("ctx_update", {
-            "project": "no-link",
-            "session_summary": f"update {i}",
-            "tool_name": "t",
+            "project": "no-link", "session_summary": f"update {i}", "tool_name": "t",
         })
         assert "error" not in r, f"update {i} failed: {r}"
     assert "update 2" in r["done"]
 
 
-def test_strict_get_match_and_mismatch(call_tool):
-    call_tool("ctx_link", {"project": "alpha", "repo_path": REPO_A})
-    ok = call_tool("ctx_strict_get", {"project": "alpha", "repo_path": REPO_A})
-    assert "error" not in ok
+def test_update_with_files_registers_map(call_tool):
+    call_tool("ctx_update", {"project": "alpha", "repo_path": REPO_A, "tool_name": "t"})
+    r = call_tool("ctx_update", {
+        "project": "alpha", "tool_name": "t", "repo_path": REPO_A,
+        "files": ["src/a.py - entry", "src/b.py - helper"],
+    })
+    assert r["files_registered"] == 2
+    assert "src/a.py" in r["map"] and "src/b.py" in r["map"]
 
-    bad = call_tool("ctx_strict_get", {"project": "alpha", "repo_path": REPO_B})
-    assert bad.get("error") == "repo_path mismatch"
+    # Files dedupe by path across calls
+    r = call_tool("ctx_update", {
+        "project": "alpha", "tool_name": "t", "repo_path": REPO_A,
+        "files": ["src/a.py - entry point"],
+    })
+    assert r["map"].count("src/a.py") == 1
 
 
-def test_strict_get_requires_link(call_tool):
-    call_tool("ctx_update", {"project": "unlinked", "session_summary": "x", "tool_name": "t"})
-    r = call_tool("ctx_strict_get", {"project": "unlinked", "repo_path": REPO_A})
+def test_update_with_author_saves_note(call_tool):
+    call_tool("ctx_update", {"project": "alpha", "repo_path": REPO_A, "tool_name": "t"})
+    r = call_tool("ctx_update", {
+        "project": "alpha", "session_summary": "Remember the deadline.",
+        "tool_name": "t", "author": "tester", "repo_path": REPO_A,
+    })
+    assert r["note_saved"] is True
+    assert r["note"]["author"] == "tester"
+    # The note is also merged into the buckets and appears in detailed history.
+    d = call_tool("ctx_get", {"project": "alpha", "view": "detailed"})
+    assert any("Remember the deadline" in m["message"] for m in d["notes"])
+
+
+# --- ctx_get: resolve / mismatch-warning / detailed folds --------------------
+
+def test_get_unknown_project_errors(call_tool):
+    r = call_tool("ctx_get", {"project": "ghost"})
+    assert "error" in r
+
+
+def test_get_resolves_project_from_repo_path(call_tool):
+    call_tool("ctx_update", {"project": "alpha", "repo_path": REPO_A, "tool_name": "t"})
+    # Omit project -> resolve from the folder (folds ctx_resolve).
+    r = call_tool("ctx_get", {"repo_path": REPO_A})
+    assert r["project"] == "alpha"
+    # A subfolder resolves to the same project.
+    sub = os.path.join(REPO_A, "src", "deep")
+    r = call_tool("ctx_get", {"repo_path": sub})
+    assert r["project"] == "alpha"
+
+
+def test_get_resolve_miss_errors(call_tool):
+    r = call_tool("ctx_get", {"repo_path": REPO_B})
     assert "error" in r
 
 
 def test_get_warns_on_mismatch(call_tool):
-    call_tool("ctx_link", {"project": "alpha", "repo_path": REPO_A})
+    call_tool("ctx_update", {"project": "alpha", "repo_path": REPO_A, "tool_name": "t"})
     r = call_tool("ctx_get", {"project": "alpha", "repo_path": REPO_B})
     assert r["safety"]["warning"] == "repo_path mismatch"
 
 
-def test_map_append_and_replace(call_tool):
-    call_tool("ctx_link", {"project": "alpha", "repo_path": REPO_A})
-    r = call_tool("ctx_map", {"project": "alpha", "files": ["src/a.py - entry", "src/b.py - helper"]})
-    assert "src/a.py" in r["map"] and "src/b.py" in r["map"]
-
-    # Append dedupes by path
-    r = call_tool("ctx_map", {"project": "alpha", "files": ["src/a.py - entry point"]})
-    assert r["map"].count("src/a.py") == 1
-
-    # Replace wipes previous entries
-    r = call_tool("ctx_map", {"project": "alpha", "files": ["src/c.py - new"], "replace": True})
-    assert "src/c.py" in r["map"] and "src/a.py" not in r["map"]
-
-
-def test_note_merge_and_no_merge(call_tool):
-    call_tool("ctx_link", {"project": "alpha", "repo_path": REPO_A})
-    r = call_tool("ctx_note", {"project": "alpha", "message": "Remember the deadline.", "author": "tester"})
-    assert r["context_updated"] is True
-    assert r["message"]["author"] == "tester"
-
-    r = call_tool("ctx_note", {"project": "alpha", "message": "Just store this.", "merge": False})
-    assert r["context_updated"] is False
-
-
-def test_note_rejects_empty_message(call_tool):
-    call_tool("ctx_link", {"project": "alpha", "repo_path": REPO_A})
-    r = call_tool("ctx_note", {"project": "alpha", "message": "   "})
-    assert "error" in r
-
-
-def test_history_returns_updates_and_messages(call_tool):
-    call_tool("ctx_link", {"project": "alpha", "repo_path": REPO_A})
-    call_tool("ctx_update", {"project": "alpha", "session_summary": "did a thing", "tool_name": "t"})
-    call_tool("ctx_note", {"project": "alpha", "message": "a note"})
-    r = call_tool("ctx_history", {"project": "alpha", "limit": 10})
+def test_get_detailed_returns_history(call_tool):
+    call_tool("ctx_update", {"project": "alpha", "repo_path": REPO_A, "tool_name": "t"})
+    call_tool("ctx_update", {"project": "alpha", "session_summary": "did a thing", "tool_name": "t", "repo_path": REPO_A})
+    call_tool("ctx_update", {"project": "alpha", "session_summary": "a note", "tool_name": "t", "author": "u", "repo_path": REPO_A})
+    r = call_tool("ctx_get", {"project": "alpha", "view": "detailed"})
     assert len(r["updates"]) >= 1
-    assert len(r["messages"]) == 1
+    assert len(r["notes"]) == 1
 
+
+# --- ctx_search --------------------------------------------------------------
 
 def test_search_across_projects(call_tool):
     call_tool("ctx_update", {"project": "p1", "session_summary": "Uses PostgreSQL for storage", "tool_name": "t"})
@@ -128,60 +149,55 @@ def test_search_across_projects(call_tool):
     assert any(m["project"] == "p1" for m in r["history"])
 
 
-def test_reset_clears_context_and_history(call_tool):
-    call_tool("ctx_update", {"project": "alpha", "session_summary": "something", "tool_name": "t"})
-    r = call_tool("ctx_reset", {"project": "alpha"})
-    assert r["status"] == "reset"
-    g = call_tool("ctx_get", {"project": "alpha"})
-    assert g["done"] == ""
-    h = call_tool("ctx_history", {"project": "alpha"})
-    assert h["updates"] == [] and h["messages"] == []
+def test_search_scoped_to_project(call_tool):
+    call_tool("ctx_update", {"project": "p1", "session_summary": "shared keyword alpha", "tool_name": "t"})
+    call_tool("ctx_update", {"project": "p2", "session_summary": "shared keyword alpha", "tool_name": "t"})
+    r = call_tool("ctx_search", {"query": "alpha", "project": "p1"})
+    assert r["scope"] == "p1"
+    assert all(m["project"] == "p1" for m in r["history"])
 
 
-def test_list_returns_projects_with_repo_path(call_tool):
-    call_tool("ctx_link", {"project": "alpha", "repo_path": REPO_A})
-    r = call_tool("ctx_list", {})
-    assert isinstance(r, list)
-    entry = next(p for p in r if p["project"] == "alpha")
-    assert entry["repo_path"] == REPO_A
-
-
-def test_bug_lifecycle(call_tool):
-    call_tool("ctx_link", {"project": "alpha", "repo_path": REPO_A})
-
-    b1 = call_tool("ctx_bug", {"project": "alpha", "description": "crash on empty input"})
-    b2 = call_tool("ctx_bug", {"project": "alpha", "description": "slow query"})
-    assert b1["status"] == "open" and b2["status"] == "open"
-
-    listed = call_tool("ctx_bug", {"project": "alpha"})
-    assert len(listed["bugs"]) == 2
-
-    fixed = call_tool("ctx_bug", {"project": "alpha", "bug_id": b1["id"], "status": "fixed"})
-    assert fixed["status"] == "fixed"
-
-    # Open bugs surface on ctx_get; fixed ones are counted
-    g = call_tool("ctx_get", {"project": "alpha"})
-    assert [b["id"] for b in g["bugs"]] == [b2["id"]]
-    assert g["bugs_fixed_count"] == 1
-
-    # Bugs appear in search
-    s = call_tool("ctx_search", {"query": "slow query"})
-    assert any(b["id"] == b2["id"] for b in s["bugs"])
-
-
-def test_bug_error_paths(call_tool):
-    call_tool("ctx_link", {"project": "alpha", "repo_path": REPO_A})
-    r = call_tool("ctx_bug", {"project": "alpha", "bug_id": 999, "status": "fixed"})
-    assert "error" in r
-    b = call_tool("ctx_bug", {"project": "alpha", "description": "x"})
-    r = call_tool("ctx_bug", {"project": "alpha", "bug_id": b["id"], "status": "wontfix"})
-    assert "error" in r
-    r = call_tool("ctx_bug", {"project": "alpha", "bug_id": b["id"]})
-    assert "error" in r  # bug_id without status
-    r = call_tool("ctx_bug", {"project": "nope"})
-    assert "error" in r  # list on unknown project
+def test_search_scope_survives_global_limit(call_tool):
+    # Scoping happens in SQL: even when another project has enough matches to
+    # fill the global LIMIT (20), a scoped search still finds its project's hit.
+    for i in range(25):
+        call_tool("ctx_update", {"project": "noisy", "session_summary": f"needle variant {i}", "tool_name": "t"})
+    call_tool("ctx_update", {"project": "quiet", "session_summary": "needle in quiet", "tool_name": "t"})
+    r = call_tool("ctx_search", {"query": "needle", "project": "quiet"})
+    assert any("quiet" in h["summary"] for h in r["history"])
+    assert all(h["project"] == "quiet" for h in r["history"])
 
 
 def test_unknown_tool(call_tool):
     r = call_tool("ctx_nonsense", {})
     assert "error" in r
+
+
+# --- capabilities that moved to CLI/DB (covered against the DB layer) ---------
+
+def test_reset_clears_context(call_tool, fresh_db):
+    call_tool("ctx_update", {"project": "alpha", "session_summary": "something", "tool_name": "t"})
+    assert reset_project("alpha")["status"] == "reset"
+    g = call_tool("ctx_get", {"project": "alpha"})
+    assert g["done"] == ""
+
+
+def test_list_projects_includes_repo_path(call_tool, fresh_db):
+    call_tool("ctx_update", {"project": "alpha", "repo_path": REPO_A, "tool_name": "t"})
+    entry = next(p for p in list_projects() if p["project"] == "alpha")
+    assert entry["repo_path"] == REPO_A
+
+
+def test_bugs_db_lifecycle_and_ctx_get_surfacing(call_tool, fresh_db):
+    call_tool("ctx_update", {"project": "alpha", "repo_path": REPO_A, "tool_name": "t"})
+    b1 = add_bug("alpha", "crash on empty input")
+    b2 = add_bug("alpha", "slow query")
+    assert b1["status"] == "open" and b2["status"] == "open"
+    assert len(list_bugs("alpha")) == 2
+
+    assert set_bug_status("alpha", b1["id"], "fixed")["status"] == "fixed"
+
+    # ctx_get still surfaces open bugs + fixed count (read-only display).
+    g = call_tool("ctx_get", {"project": "alpha"})
+    assert [b["id"] for b in g["bugs"]] == [b2["id"]]
+    assert g["bugs_fixed_count"] == 1

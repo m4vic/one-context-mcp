@@ -2,7 +2,7 @@
 
 import threading
 
-from ctx.database import atomic_merge_update, get_project, init_project
+from ctx.database import atomic_merge_update, get_project, init_project, merge_project_map
 
 
 def test_no_lost_updates_under_concurrent_writers(fresh_db):
@@ -30,6 +30,26 @@ def test_no_lost_updates_under_concurrent_writers(fresh_db):
     done = get_project("race")["done"]
     markers = sorted(int(line[1:]) for line in done.splitlines() if line.startswith("X"))
     assert markers == list(range(n_workers)), "concurrent writes were lost"
+
+
+def test_no_lost_map_entries_under_concurrent_writers(fresh_db):
+    # The ctx_update files= fold goes through merge_project_map; concurrent
+    # registrations must all survive.
+    init_project("maprace", repo_path="")
+
+    n_workers = 20
+    threads = [
+        threading.Thread(target=merge_project_map, args=("maprace", f"- src/f{i}.py - part {i}"))
+        for i in range(n_workers)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    final_map = get_project("maprace")["map"]
+    for i in range(n_workers):
+        assert f"src/f{i}.py" in final_map, "concurrent MAP merge lost an entry"
 
 
 def test_atomic_update_unknown_project(fresh_db):

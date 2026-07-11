@@ -27,9 +27,19 @@ def test_now_extracts_progress_sentences():
     assert "docs" in r["now"]
 
 
-def test_previous_now_moves_to_done():
-    r = _local_merge("", "", "- old task in flight", "", "Shipped the old task.", "t")
+def test_previous_now_moves_to_done_when_replaced():
+    r = _local_merge("", "", "- old task in flight", "", "Shipped it. Currently working on docs.", "t")
     assert "old task in flight" in r["done"]
+    assert "docs" in r["now"]
+    assert "old task in flight" not in r["now"]
+
+
+def test_now_kept_when_summary_has_no_progress_signal():
+    # A summary without a current-task signal must not blank NOW - the next
+    # tool still needs to see what's in progress.
+    r = _local_merge("", "", "- rate limiting middleware", "", "Fixed a typo in README.", "t")
+    assert r["now"] == "- rate limiting middleware"
+    assert "rate limiting middleware" not in r["done"]
 
 
 def test_done_deduplicates_lines():
