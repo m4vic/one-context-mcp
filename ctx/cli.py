@@ -113,8 +113,40 @@ def status(project):
 @click.argument("project")
 def reset(project):
     """Reset a project's context back to empty."""
+    from ctx.mirror import write_mirror
     reset_project(project)
+    write_mirror(project)  # keep the .ctx/context.md mirror in step
     print(f"[OK] Project '{project}' has been reset to empty.")
+
+
+@cli.command()
+@click.argument("project", required=False)
+@click.option("--all", "sync_all", is_flag=True, help="Sync every linked project")
+def sync(project, sync_all):
+    """Write the grep-able .ctx/context.md mirror for a project (or --all).
+
+    The mirror is a plain-Markdown snapshot of a project's context, written to
+    <repo>/.ctx/context.md so tools can read it directly (no MCP call) and you
+    can grep/commit it. It refreshes automatically on every ctx_update; use this
+    to materialize it now (e.g. right after upgrading).
+    """
+    from ctx.mirror import write_mirror
+    from ctx.database import list_projects
+
+    if not project and not sync_all:
+        print("[!] Give a project name or --all.")
+        return
+    targets = [p["project"] for p in list_projects()] if sync_all else [project]
+    wrote = 0
+    for name in targets:
+        path = write_mirror(name)
+        if path:
+            print(f"[OK] {name} -> {path}")
+            wrote += 1
+        else:
+            print(f"[--] {name}: not linked to an existing repo (or mirror disabled)")
+    if sync_all:
+        print(f"Synced {wrote}/{len(targets)} project(s).")
 
 @cli.command(name="list")
 def list_cmd():
@@ -187,12 +219,15 @@ def import_cmd(file, mode):
             print(f"[!] Not valid JSON: {e}")
             return
 
+    from ctx.mirror import write_mirror
+
     projects = payload["projects"] if isinstance(payload, dict) and "projects" in payload else [payload]
     for p in projects:
         result = import_project(p, mode=mode)
         if "error" in result:
             print(f"[!] {result['error']}")
         else:
+            write_mirror(result["project"])  # refresh the mirror after import
             stats = result.get("imported", {})
             print(f"[OK] Imported '{result['project']}' ({mode}): "
                   f"+{stats.get('updates', 0)} updates, +{stats.get('messages', 0)} notes, "

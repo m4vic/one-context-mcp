@@ -275,6 +275,28 @@ Backup/restore is a CLI operation (since 0.6.0 it is not part of the MCP tool su
 
 ---
 
+## Local File Mirror (`.ctx/context.md`)
+
+Since 0.7.0, every context update also writes a plain-Markdown snapshot to
+`<repo>/.ctx/context.md`. This gives you a read path that needs **no MCP call**:
+grep it, `diff` it, commit it, or point your `CLAUDE.md`/`AGENTS.md` at it so a tool
+loads project memory at session start for free. MCP is then only needed for the
+write (`ctx_update`), where the cross-tool merge happens.
+
+```bash
+ctx sync myproject      # write/refresh the mirror for one project now
+ctx sync --all          # every linked project
+```
+
+The mirror is **on by default**. It only writes under a repo root that already
+exists, and it is one well-known path you can add to `.gitignore`. To disable it:
+
+```bash
+CTX_MIRROR=0 ...        # (or CTX_DISABLE_MIRROR=1)
+```
+
+---
+
 ## Merge Modes
 
 Local merge is the default and never calls a model or an API. This is the recommended setting for normal use.

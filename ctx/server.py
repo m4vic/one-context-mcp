@@ -38,8 +38,9 @@ from ctx.database import (
     list_docs,
     delete_doc,
 )
-from ctx.llm import merge_context
+from ctx.llm import merge_context, now_source_tools
 from ctx.git import get_git_summary
+from ctx.mirror import write_mirror
 
 logger = logging.getLogger("ctx")
 
@@ -87,6 +88,9 @@ THE 5 TOOLS
 RULES OF THUMB
 - Buckets (WHAT/DONE/NOW/MAP) are auto-merged and summarized - good for evolving
   state, lossy. Anything that must survive word-for-word goes in ctx_doc.
+- Entries are tagged with the tool that wrote them, e.g. "- [codex @ ts] ...".
+  If ctx_get returns a `now_conflict`, two tools disagree on the current task -
+  reconcile it (finish/drop one) instead of blindly proceeding.
 - One stable project per repo; resolve it from the folder, never from memory.
 - Always pass repo_path as an ABSOLUTE workspace root (a relative path would
   resolve against the server's cwd, not yours) so cross-project mixing is
@@ -391,6 +395,16 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
                 result["bugs"] = list_bugs(project, status="open")
                 result["bugs_fixed_count"] = count_bugs(project, "fixed")
 
+                # Cross-tool conflict: if NOW holds active entries from more
+                # than one tool, they disagree on the current task - surface it
+                # so the human/next tool reconciles instead of one silently winning.
+                now_tools = now_source_tools(result.get("now", ""))
+                if len(now_tools) > 1:
+                    result["now_conflict"] = {
+                        "tools": now_tools,
+                        "note": "Multiple tools have active NOW entries; reconcile before continuing.",
+                    }
+
                 # Surface verbatim docs: the 'instructions' doc is returned in
                 # full at the top; other docs appear as an index unless detailed.
                 docs_index = list_docs(project)
@@ -519,6 +533,14 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
             result.update(did)
             if not session_summary and not files:
                 result["status"] = "linked" if repo_path else "no-op"
+
+            # Mirror the fresh snapshot to <repo>/.ctx/context.md. Off the event
+            # loop and best-effort: a mirror failure must never fail the update
+            # that already committed to the DB.
+            if result.get("repo_path"):
+                mirror = await asyncio.to_thread(write_mirror, project, result["repo_path"])
+                if mirror:
+                    result["mirror"] = mirror
             return _reply(result)
 
         elif name == "ctx_doc":

@@ -132,6 +132,41 @@ def _parse_llm_response(text: str, current_what: str, current_done: str,
 # 1. LOCAL MERGE (default - always works, zero dependencies)
 # ---------------------------------------------------------------------------
 
+# Matches a provenance-tagged bucket entry: "- [tool @ 2026-07-23 14:20] text"
+# The timestamp part is optional so "- [tool] text" also parses.
+_ENTRY_TAG_RE = re.compile(r'^\s*[-*]\s*\[(?P<tool>[^\]@]+?)(?:\s*@\s*[^\]]*)?\]\s*(?P<text>.*)$')
+
+
+def _parse_entry(line: str) -> tuple[Optional[str], str]:
+    """Split a bucket line into (source_tool, text).
+
+    Returns (tool, text) for a tagged line like "- [codex @ ts] did X", or
+    (None, original_line) for an untagged/legacy line. This is the single
+    place that understands the provenance tag format shared by WHAT/DONE/NOW.
+    """
+    m = _ENTRY_TAG_RE.match(line)
+    if m:
+        return m.group("tool").strip() or None, m.group("text").strip()
+    return None, line.strip()
+
+
+def now_source_tools(now_text: str) -> list[str]:
+    """Distinct source tools among the NOW entries, in first-seen order.
+
+    Used both by the merge (to keep other tools' active NOW) and by ctx_get
+    (to flag a cross-tool conflict), so the tag parsing lives in one place.
+    Untagged/legacy entries do not contribute a source.
+    """
+    seen: list[str] = []
+    for line in now_text.splitlines():
+        if not line.strip():
+            continue
+        tool, _ = _parse_entry(line)
+        if tool and tool not in seen:
+            seen.append(tool)
+    return seen
+
+
 def _deduplicate_lines(text: str) -> str:
     """Remove duplicate bullet points while preserving order."""
     seen = set()
@@ -211,12 +246,15 @@ def _local_merge(
 
     Strategy:
     - WHAT: Update only if summary contains project-level keywords.
-    - DONE: Move current NOW to DONE when it is replaced, then add the new
-      summary entry.
-    - NOW: Extract "in progress" / "next" signals from summary; if the
-      summary carries no such signal, keep the current NOW instead of
-      blanking the next tool's view of what's in progress.
-    - MAP: Extract file paths mentioned in the summary.
+    - DONE: When this tool replaces its own NOW, that finished task rotates
+      into DONE, then the new summary entry is appended.
+    - NOW: Extract "in progress" / "next" signals and tag each with this tool.
+      Cross-tool aware: writing a new NOW rotates only THIS tool's own (and
+      untagged legacy) NOW into DONE and keeps OTHER tools' active NOW, so two
+      tools working in parallel don't clobber each other. A summary with no
+      such signal leaves NOW untouched.
+    - MAP: Extract file paths mentioned in the summary (kept untagged - MAP is
+      a normalized, deduped file index, not a per-tool narrative).
     """
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')
 
@@ -234,31 +272,51 @@ def _local_merge(
         new_what = (current_what.rstrip() + '\n' + entry).strip() if current_what else entry
         new_what = _deduplicate_lines(new_what)
 
-    # --- NOW ---
+    # --- NOW (cross-tool aware, per-entry provenance) ---
     now_keywords = [
         'currently', 'in progress', 'working on', 'next step',
         'todo', 'to do', 'needs to', 'will ', 'planning to',
         'starting', 'beginning',
     ]
-    new_now = ''
+    this_tool_now: list[str] = []
     for sentence in re.split(r'[.\n]', session_summary):
         sentence = sentence.strip()
         if sentence and any(kw in sentence.lower() for kw in now_keywords):
-            new_now += f'- {sentence}\n'
-    new_now = new_now.strip()
+            this_tool_now.append(f'- [{tool_name} @ {timestamp}] {sentence}')
+
+    # Split the existing NOW by source: this tool's own, other tools', legacy.
+    own_now, other_now, legacy_now = [], [], []
+    for line in current_now.splitlines():
+        if not line.strip():
+            continue
+        src, _ = _parse_entry(line)
+        if src is None:
+            legacy_now.append(line)
+        elif src == tool_name:
+            own_now.append(line)
+        else:
+            other_now.append(line)
 
     # --- DONE ---
     new_done = current_done
-    if new_now and current_now.strip():
-        # NOW is being replaced: the previous current task becomes history.
-        new_done = (new_done.rstrip() + '\n' + current_now.strip()).strip() if new_done.strip() else current_now.strip()
+    if this_tool_now:
+        # This tool moved on: its previous NOW (and ambiguous legacy NOW) is
+        # now history. Other tools' active NOW is left untouched below.
+        rotated = [_parse_entry(l)[1] if _parse_entry(l)[0] is None else l
+                   for l in (own_now + legacy_now)]
+        for done_line in rotated:
+            done_line = done_line if done_line.strip().startswith('-') else f'- {done_line}'
+            new_done = (new_done.rstrip() + '\n' + done_line).strip() if new_done.strip() else done_line
     entry = f'- [{tool_name} @ {timestamp}] {session_summary}'
     new_done = (new_done.rstrip() + '\n' + entry).strip() if new_done.strip() else entry
     new_done = _deduplicate_lines(new_done)
     new_done = _trim_to_max_items(new_done, max_items=50)
 
-    if not new_now:
-        # No current-task signal in this summary: keep the existing NOW.
+    if this_tool_now:
+        # Keep other tools' active NOW, append this tool's fresh NOW.
+        new_now = '\n'.join(other_now + this_tool_now).strip()
+    else:
+        # No current-task signal: leave NOW exactly as it was (all tools).
         new_now = current_now.strip()
 
     # --- MAP ---

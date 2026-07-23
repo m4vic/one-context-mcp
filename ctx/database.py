@@ -651,7 +651,9 @@ def set_doc(project: str, kind: str, content: str, updated_by: str = "") -> dict
     if row is None:
         conn.close()
         return {"error": f"Project '{project}' not found. Create it first with ctx_update(project=..., repo_path=...)."}
-    content = trim_bucket(content or "", _doc_cap())
+    raw = content or ""
+    original_chars = len(raw)
+    content = trim_bucket(raw, _doc_cap())
     ts = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """INSERT INTO project_docs (project, kind, content, updated_at, updated_by)
@@ -664,7 +666,13 @@ def set_doc(project: str, kind: str, content: str, updated_by: str = "") -> dict
     )
     conn.commit()
     conn.close()
-    return {"status": "saved", "project": project, "kind": kind, "chars": len(content)}
+    result = {"status": "saved", "project": project, "kind": kind, "chars": len(content)}
+    if len(content) < original_chars:
+        # "Verbatim" must never trim silently - tell the caller it was cut.
+        result["truncated"] = True
+        result["original_chars"] = original_chars
+        result["hint"] = f"Content exceeded CTX_MAX_DOC_CHARS ({_doc_cap()}); stored the last {len(content)} chars."
+    return result
 
 
 def get_doc(project: str, kind: str) -> dict:

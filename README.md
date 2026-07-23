@@ -127,13 +127,40 @@ The buckets (`WHAT`/`DONE`/`NOW`/`MAP`) are **auto-merged and summarized** — g
 
 ---
 
+## Cross-tool merge & provenance (the part other memory tools don't do)
+
+Most "AI memory" MCP servers *store* or *semantically search*. one-context **merges**: it reconciles what each tool did into one project state.
+
+- **Every entry is tagged with the tool that wrote it** — `WHAT`/`DONE`/`NOW` lines look like `- [codex @ 2026-07-23 14:20] added rate limiting`. You can see at a glance who contributed what.
+- **NOW is cross-tool aware.** When a tool records a new current task, it retires **its own** previous task to `DONE` but **keeps other tools' active work** — so Claude and Codex working in parallel don't clobber each other.
+- **Conflicts are surfaced, not silently resolved.** If two different tools both have an active `NOW`, `ctx_get` returns a `now_conflict` flag listing the tools, so you (or the next assistant) reconcile it instead of one tool silently winning.
+
+```jsonc
+// ctx_get response when two tools disagree on the current task
+"now": "- [claude @ ...] refactor auth\n- [codex @ ...] add rate limiting",
+"now_conflict": { "tools": ["claude", "codex"], "note": "Multiple tools have active NOW entries; reconcile before continuing." }
+```
+
+---
+
+## Two ways to read your context
+
+MCP tool calls cost tokens. So one-context gives you a read path that doesn't need one:
+
+1. **The file (no MCP call).** Every update mirrors the project's context to a plain-Markdown `<repo>/.ctx/context.md` — grep it, `diff` it, commit it, or have your tool auto-read it at session start (point your `CLAUDE.md`/`AGENTS.md` at it). Zero tool-call overhead.
+2. **MCP (the write path).** `ctx_update` is where the deterministic cross-tool merge happens — that's what earns the round-trip. Reads can come from the file; writes go through MCP.
+
+The mirror is **on by default**; it only writes under repo roots that already exist, and it's one well-known path you can `.gitignore`. Disable it with `CTX_MIRROR=0`. Materialize it for existing projects any time with `ctx sync <project>` (or `ctx sync --all`).
+
+---
+
 ## MCP Tools
 
 **5 focused tools** (since 0.6.0). The job is a smooth, correct context handoff between tools — not a big tool surface.
 
 | Tool | Purpose |
 |------|---------|
-| `ctx_get(project?, repo_path?, view?)` | Load a project's context (+ git). Omit `project` to auto-resolve it from `repo_path`. `view`: `full` (default), `brief` (recent DONE only), `detailed` (full verbatim history + notes + docs). A mismatched `repo_path` returns a safety warning. |
+| `ctx_get(project?, repo_path?, view?)` | Load a project's context (+ git). Omit `project` to auto-resolve it from `repo_path`. `view`: `full` (default), `brief` (recent DONE only), `detailed` (full verbatim history + notes + docs). A mismatched `repo_path` returns a safety warning; competing NOWs from different tools return a `now_conflict`. |
 | `ctx_update(project?, session_summary?, tool_name, repo_path?, author?, files?)` | Persist state (merged into WHAT/DONE/NOW/MAP). `repo_path` also links the project. `author` records a verbatim user note. `files` registers important files. Empty summary + `repo_path` just links/creates the project. |
 | `ctx_doc(project, kind, content?, action?)` | Read/write a **verbatim** doc (`plan`, `instructions`, `context`, `handoff`, …) — stored exactly, never summarized. |
 | `ctx_search(query, project?)` | Search context, history, notes, and bugs; optional `project` scope. |
@@ -196,6 +223,7 @@ ctx import f.json             # Restore/merge an exported backup
 ctx reset <project>           # Clear a project's context
 ctx delete <project>          # Permanently delete a project
 ctx list                      # List all projects
+ctx sync <project>            # Write the .ctx/context.md mirror now (--all for every project)
 ctx serve --port 7337         # Start HTTP/SSE server (localhost only by default)
 ctx stdio                     # Start stdio MCP server
 ```

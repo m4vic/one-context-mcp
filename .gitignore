@@ -15,6 +15,9 @@ env/
 # Database
 *.db
 
+# one-context local mirror (grep-able snapshot; regenerate with `ctx sync`)
+.ctx/
+
 # IDE
 .idea/
 .vscode/
