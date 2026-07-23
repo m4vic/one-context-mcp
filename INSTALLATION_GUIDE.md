@@ -111,7 +111,7 @@ ctx stdio
 Install a specific version:
 
 ```bash
-pip install one-ctx==0.6.0
+pip install one-ctx==0.7.0
 ```
 
 ---
@@ -401,7 +401,7 @@ pip install -U one-ctx
 Specific version:
 
 ```bash
-pip install one-ctx==0.6.0
+pip install one-ctx==0.7.0
 ```
 
 Install directly from GitHub:
