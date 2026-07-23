@@ -42,6 +42,21 @@ Full setup instructions are in [INSTALLATION_GUIDE.md](INSTALLATION_GUIDE.md).
 
 ---
 
+## What's New in 0.7.0
+
+Most "AI memory" tools just *store* context. **0.7.0 makes one-context *merge* it across tools** — and gives you a way to read it without spending a single tool-call token.
+
+- **Per-tool provenance.** Every `WHAT`/`DONE`/`NOW` entry is now tagged with the tool that wrote it — `- [codex @ 2026-07-23 14:20] added rate limiting`. You can see who did what. → [Cross-tool merge & provenance](#cross-tool-merge--provenance-the-part-other-memory-tools-dont-do)
+- **Cross-tool `NOW`, no clobber.** When one tool records a new current task, it retires *its own* previous task to `DONE` but keeps *other* tools' active work. Claude and Codex in parallel no longer overwrite each other.
+- **Conflict surfacing.** If two tools have competing current tasks, `ctx_get` returns a `now_conflict` so you reconcile it instead of one silently winning.
+- **A file you can grep (no MCP call).** Every update mirrors the project to `<repo>/.ctx/context.md`. Read it directly, `diff` it, commit it, or point your `CLAUDE.md`/`AGENTS.md` at it. → [Two ways to read your context](#two-ways-to-read-your-context)
+- **`ctx sync`.** New CLI command to write/refresh that mirror on demand (`ctx sync <project>` or `--all`).
+- **Honest verbatim docs.** `ctx_doc` now tells you (`truncated`, `original_chars`) if a doc exceeded the size cap instead of trimming silently.
+
+Upgrading is drop-in — no schema migration, existing `~/.ctx/ctx.db` just works. The only visible change: `.ctx/context.md` starts appearing in linked repos (it's `.gitignore`-friendly; disable with `CTX_MIRROR=0`).
+
+---
+
 ## Why It Exists
 
 Every coding assistant has its own short-term context. When you move from Claude to Cline, from Cline to Codex, or from one IDE session to another, you usually explain the same project again:
